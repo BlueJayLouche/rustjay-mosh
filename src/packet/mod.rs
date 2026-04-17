@@ -48,29 +48,29 @@ impl PacketClip {
 }
 
 /// Build the effective flat packet sequence for a contiguous clip span.
-/// `rewire_start` indicates whether the first keyframe of this clip should be
-/// dropped so that the decoder state bleeds in from the preceding clip.
+/// `drop_leading_keyframe` indicates whether the first *visible* keyframe of
+/// this span should be dropped so that the decoder state bleeds in from the
+/// preceding clip.
 #[derive(Debug, Clone)]
 pub struct ClipSpan<'a> {
     pub clip: &'a PacketClip,
-    /// If true, skip the first keyframe and start from the first P-frame.
+    /// Number of source packets to skip from the start of the clip.
+    pub source_offset: usize,
+    /// How many source packets to include after the offset.
+    pub visible_count: usize,
+    /// If true, skip the first visible keyframe and start from the first P-frame.
     pub drop_leading_keyframe: bool,
 }
 
 impl<'a> ClipSpan<'a> {
     pub fn iter_packets(&self) -> impl Iterator<Item = &'a OwnedPacket> + use<'a> {
-        let start = if self.drop_leading_keyframe {
-            // For our transcode (-g 99999999) the first frame is the only keyframe.
-            1
-        } else {
-            0
-        };
-        self.clip.packets.iter().skip(start)
+        let start = self.source_offset + if self.drop_leading_keyframe { 1 } else { 0 };
+        self.clip.packets.iter().skip(start).take(self.visible_count)
     }
 
     pub fn packet_count(&self) -> usize {
-        let start = if self.drop_leading_keyframe { 1 } else { 0 };
-        self.clip.packets.len().saturating_sub(start)
+        self.visible_count
+            .min(self.clip.packets.len().saturating_sub(self.source_offset))
     }
 }
 

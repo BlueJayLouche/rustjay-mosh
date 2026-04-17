@@ -29,7 +29,10 @@ The result is the iconic "melting" or "smearing" glitch aesthetic found in music
 - **FFmpeg importer** — open any format ffmpeg supports (mp4, mov, mkv, avi, webm, …). Each clip is transparently transcoded to a long-GOP H.264 intermediate with one I-frame and all P-frames.
 - **Packet-based datamoshing** — no custom software codec. We manipulate the raw H.264 packet stream directly, so output looks identical to professional tools like Supermosh.
 - **Fast import** — clips appear on the timeline instantly; no background P-frame encoding step.
+- **Clip pool** — imported clips live in a left sidebar; drag any pool item onto the timeline
 - **Interactive timeline** — drag clips, scrub the playhead, zoom with Ctrl+scroll
+- **Trim handles** — drag the left/right edges of a placed clip to set in/out points
+- **Snap-to-edge** — dragging a clip body snaps its start or end to the nearest clip edge
 - **Cross-clip mosh** — one click drops the leading keyframe of the selected clip so it bleeds into the preceding clip
 - **wgpu preview** — GPU-accelerated YUV→RGB display via a WGSL BT.601 shader; no CPU colour conversion
 - **Render to MP4** — remuxes the manipulated packet stream directly to H.264 MP4 without re-encoding
@@ -63,24 +66,26 @@ cargo run --release
 ### Basic workflow
 
 1. **Import clips** — click **➕ Import clip** (repeat for each clip).  
-   Each clip is transcoded to a one-keyframe H.264 stream and placed end-to-end on the timeline.
+   Each clip is transcoded to a one-keyframe H.264 stream and appears in the **Clip Pool** on the left.
 
-2. **Arrange** — drag clips to reorder them on the timeline.  
-   The playhead scrubs the preview.
+2. **Build the timeline** — drag clips from the pool onto the timeline track, or rearrange existing clips by dragging their bodies. Clips snap end-to-end automatically when dragged close to another edge.
 
-3. **Cross-clip mosh** — select clip B, click **⚡ Cross-clip mosh**.  
-   Clip B's leading I-frame is dropped; its P-frames now decode against clip A's pixels.  
+3. **Trim** — drag the left or right edge of a placed clip to trim its in/out points. A red vertical line shows the leading keyframe when it is still visible; a dark stripe indicates trimmed-away head frames.
+
+4. **Cross-clip mosh** — select clip B, click **⚡ Cross-clip mosh**.  
+   Clip B's leading I-frame is dropped and the clip shrinks by one frame; its P-frames now decode against clip A's pixels.  
    Clip A's pixels morph through clip B's motion.
 
-4. **Render** — set the output FPS, click **🎬 Render to file…**, choose an output path.  
+5. **Render** — set the output FPS, click **🎬 Render to file…**, choose an output path.  
    The packet sequence is rewritten with monotonic timestamps and remuxed to MP4.
 
 ### Timeline controls
 
 | Action | Gesture |
 |---|---|
-| Select clip | Click |
-| Move clip | Drag |
+| Select clip | Click body |
+| Move clip | Drag body |
+| Trim in/out | Drag left/right edge |
 | Move playhead | Click ruler or empty track |
 | Pan timeline | Scroll |
 | Zoom timeline | Ctrl + scroll |
@@ -123,7 +128,7 @@ cargo run --release
 | `frame_graph` | DAG of frame references (legacy data structure) |
 | `datamosh` | Graph-level operations (legacy, kept for reference) |
 | `ui::app` | `MoshApp` — eframe application, wires everything together |
-| `ui::timeline_panel` | `TimelinePanel` egui widget — clips, drag, playhead |
+| `ui::timeline_panel` | `TimelinePanel` egui widget — clips, drag, trim handles, snap, playhead |
 | `ui::preview` | `YuvResources` + `YuvPreviewCallback` — wgpu YUV→RGB render pipeline |
 | `ui::shader.wgsl` | BT.601 YCbCr→RGB WGSL fragment shader |
 
@@ -131,9 +136,11 @@ cargo run --release
 
 ## Roadmap
 
+- [ ] Timecode ruler (`hh:mm:ss:ff`) on timeline
+- [ ] Audio track support with fades and visible waveforms
 - [ ] Audio passthrough in render
 - [ ] Motion vector visualisation overlay
-- [ ] Waveform / thumbnail strip on timeline clips
+- [ ] Thumbnail strip on timeline clips
 - [ ] Selective frame dropping / duplicating for advanced glitch effects
 - [ ] Export to formats other than H.264
 

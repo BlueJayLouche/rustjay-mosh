@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 
-use eframe::egui;
+use eframe::egui::{self, CursorIcon};
 use eframe::egui_wgpu;
 
 use crate::codec::ir::Yuv420;
@@ -152,7 +152,9 @@ impl MoshApp {
             clip_idx,
             name: r.name.clone(),
             frame_count,
+            source_frame_count: frame_count,
             start_frame,
+            source_offset: 0,
             color: next_clip_color(self.color_idx),
             selected: false,
             drop_leading_keyframe: false,
@@ -181,11 +183,17 @@ impl MoshApp {
             return;
         }
 
-        self.timeline.clips[b_idx].drop_leading_keyframe = true;
+        let clip = &mut self.timeline.clips[b_idx];
+        clip.drop_leading_keyframe = true;
+        // Shrinking by 1 frame keeps the timeline duration in sync with the
+        // actual packet count after the leading keyframe is dropped.
+        if clip.frame_count > 1 {
+            clip.frame_count -= 1;
+        }
         self.preview_cache = None;
         self.status = format!(
             "Cross-clip mosh: dropped leading keyframe of '{}'.",
-            self.timeline.clips[b_idx].name
+            clip.name
         );
     }
 
@@ -225,21 +233,19 @@ impl MoshApp {
             let can_drop = prev_ends.map_or(false, |end| end == clip.start_frame);
             let drop = can_drop && clip.drop_leading_keyframe;
             let packet_clip = &self.packet_clips[clip.clip_idx];
-            let start = if drop { 1 } else { 0 };
-            let mut first_pts = None;
-            for pkt in packet_clip.packets.iter().skip(start) {
-                let mut adjusted = pkt.clone();
-                if first_pts.is_none() {
-                    first_pts = Some(pkt.pts);
+            let start = clip.source_offset + if drop { 1 } else { 0 };
+            let packets_iter = packet_clip.packets.iter().skip(start).take(clip.frame_count);
+            if let Some(first_pkt) = packets_iter.clone().next() {
+                let first = first_pkt.pts;
+                for pkt in packets_iter {
+                    let mut adjusted = pkt.clone();
+                    adjusted.pts = pkt.pts - first + pts_offset;
+                    adjusted.dts = pkt.dts - first + pts_offset;
+                    render_packets.push(adjusted);
                 }
-                adjusted.pts = pkt.pts + pts_offset;
-                adjusted.dts = pkt.dts + pts_offset;
-                render_packets.push(adjusted);
-            }
-            if let (Some(first), Some(last)) =
-                (first_pts, packet_clip.packets.iter().skip(start).last())
-            {
-                pts_offset += last.pts + last.duration - first;
+                if let Some(last) = packet_clip.packets.iter().skip(start).take(clip.frame_count).last() {
+                    pts_offset += last.pts + last.duration - first;
+                }
             }
         }
 
@@ -295,6 +301,8 @@ impl MoshApp {
             let drop_leading_keyframe = can_drop && clip.drop_leading_keyframe;
             spans.push(ClipSpan {
                 clip: &self.packet_clips[clip.clip_idx],
+                source_offset: clip.source_offset,
+                visible_count: clip.frame_count,
                 drop_leading_keyframe,
             });
         }
@@ -318,7 +326,32 @@ impl MoshApp {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    fn add_timeline_clip_from_pool(&mut self, pool_idx: usize, target_frame: i64) {
+        if pool_idx >= self.packet_clips.len() {
+            return;
+        }
+        let packet_clip = &self.packet_clips[pool_idx];
+        let frame_count = packet_clip.packets.len();
+        let mut start_frame = target_frame.max(0);
+        start_frame = self.timeline.snap_start_frame(start_frame, frame_count, None);
 
+        self.timeline.clips.push(TimelineClip {
+            id: self.clip_uid,
+            clip_idx: pool_idx,
+            name: packet_clip.name.clone(),
+            frame_count,
+            source_frame_count: frame_count,
+            start_frame,
+            source_offset: 0,
+            color: next_clip_color(self.color_idx),
+            selected: false,
+            drop_leading_keyframe: false,
+        });
+        self.clip_uid += 1;
+        self.color_idx += 1;
+        self.preview_cache = None;
+        self.timeline.clips.sort_by_key(|c| c.start_frame);
+    }
 }
 
 // ── eframe::App ───────────────────────────────────────────────────────────────
@@ -378,6 +411,28 @@ impl eframe::App for MoshApp {
                 ui.separator();
                 ui.label(&self.status);
             });
+        });
+
+        // ── Pool sidebar ──────────────────────────────────────────────────────
+        egui::SidePanel::left("pool").min_width(160.0).show(ctx, |ui| {
+            ui.heading("Clip Pool");
+            ui.separator();
+            for (idx, clip) in self.packet_clips.iter().enumerate() {
+                let label = format!("{} ({}f)", clip.name, clip.packets.len());
+                let response = ui.dnd_drag_source(egui::Id::new(("pool", idx)), idx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("🎬");
+                        ui.label(&label);
+                    })
+                    .response
+                });
+                if response.inner.hovered() {
+                    ui.output_mut(|o| o.cursor_icon = CursorIcon::Grab);
+                }
+            }
+            if self.packet_clips.is_empty() {
+                ui.label("Import a clip to begin.");
+            }
         });
 
         // ── Controls sidebar ──────────────────────────────────────────────────
@@ -469,8 +524,14 @@ impl eframe::App for MoshApp {
             .min_height(100.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
-                self.timeline.show(ui);
+                let tl_resp = self.timeline.show(ui);
                 ui.add_space(4.0);
+
+                if let (Some(pool_idx), Some(drop_frame)) =
+                    (tl_resp.dropped_pool_idx, tl_resp.drop_frame)
+                {
+                    self.add_timeline_clip_from_pool(pool_idx, drop_frame);
+                }
             });
 
         // ── Preview (centre) ──────────────────────────────────────────────────
