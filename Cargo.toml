@@ -1,0 +1,14 @@
+[package]
+name = "rustjay-mosh"
+version = "0.1.0"
+edition = "2024"
+description = "Rust-based NLE focused on datamoshing via I-frame removal and motion-vector manipulation"
+license = "MIT"
+
+[dependencies]
+thiserror = "2"
+ffmpeg-next = "8"
+eframe = { version = "0.29", features = ["wgpu"] }
+wgpu = "22"
+rfd = "0.15"
+
