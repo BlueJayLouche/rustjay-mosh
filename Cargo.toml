@@ -5,6 +5,11 @@ edition = "2024"
 description = "Rust-based NLE focused on datamoshing via I-frame removal and motion-vector manipulation"
 license = "MIT"
 
+# Numeric-heavy codec code is unusably slow without any optimisation in debug.
+# opt-level 1 keeps incremental compile fast while speeding up the encoder ~10×.
+[profile.dev]
+opt-level = 1
+
 [dependencies]
 thiserror = "2"
 ffmpeg-next = "8"

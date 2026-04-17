@@ -56,12 +56,15 @@ pub fn encode_pframe(
     }
 }
 
-/// Encode raw decoded frames into an interleaved I/P sequence and append them
-/// to `store`. Returns the slice of `store` that was added.
+/// Encode raw decoded frames into an interleaved I/P sequence and push them
+/// into `store`.
+///
+/// `store_offset` is the index in the *global* frame store at which `store[0]`
+/// will live; P-frame `.reference` values are written as global indices so the
+/// frames can be appended directly to the global store without patching.
 ///
 /// I-frames are inserted at position 0 and every `keyframe_interval` frames.
-/// Each P-frame references the immediately preceding frame in `store`.
-/// `search_range` controls the half-range (in pixels) for motion estimation.
+/// Returns the global `Range` that was added.
 pub fn encode_clip_as_ip(
     raw_frames: &[Yuv420],
     mb_size: MacroblockSize,
@@ -69,8 +72,9 @@ pub fn encode_clip_as_ip(
     keyframe_interval: usize,
     pts_offset: u64,
     store: &mut Vec<Frame>,
+    store_offset: usize,
 ) -> Range<usize> {
-    let start = store.len();
+    let local_start = store.len();
 
     for (i, yuv) in raw_frames.iter().enumerate() {
         let pts = pts_offset + i as u64;
@@ -80,12 +84,15 @@ pub fn encode_clip_as_ip(
             store.push(encode_iframe(yuv.clone(), pts, mb_size));
         } else {
             let ref_raw = &raw_frames[i - 1];
-            let ref_store_idx = (store.len() - 1) as u32;
-            store.push(encode_pframe(yuv, ref_raw, ref_store_idx, pts, mb_size, search_range));
+            // Global index of the frame we are predicting from.
+            let ref_global_idx = (store_offset + store.len() - 1) as u32;
+            store.push(encode_pframe(yuv, ref_raw, ref_global_idx, pts, mb_size, search_range));
         }
     }
 
-    start..store.len()
+    let global_start = store_offset + local_start;
+    let global_end = store_offset + store.len();
+    global_start..global_end
 }
 
 fn find_best_mv(
