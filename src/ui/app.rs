@@ -33,6 +33,9 @@ struct Phase2Result {
     i_frame_indices: Vec<usize>,
 }
 
+/// Render thread result: success message or error string.
+type RenderResult = Result<String, String>;
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 pub struct MoshApp {
@@ -56,9 +59,12 @@ pub struct MoshApp {
 
     render_rx: mpsc::Receiver<PathBuf>,
     render_tx: mpsc::SyncSender<PathBuf>,
+    render_result_rx: mpsc::Receiver<RenderResult>,
+    render_result_tx: mpsc::SyncSender<RenderResult>,
 
     /// Clips currently being P-frame encoded (show badge on timeline).
     encoding_clips: Vec<usize>,
+    is_rendering: bool,
     status: String,
     render_fps: u32,
 }
@@ -75,6 +81,7 @@ impl MoshApp {
         let (p1_tx, p1_rx) = mpsc::sync_channel(1);
         let (p2_tx, p2_rx) = mpsc::sync_channel(4);
         let (render_tx, render_rx) = mpsc::sync_channel(1);
+        let (render_result_tx, render_result_rx) = mpsc::sync_channel(1);
         Self {
             pool: MediaPool::new(),
             frame_store: vec![],
@@ -90,7 +97,10 @@ impl MoshApp {
             p2_tx,
             render_rx,
             render_tx,
+            render_result_rx,
+            render_result_tx,
             encoding_clips: vec![],
+            is_rendering: false,
             status: "Open a video file to begin.".into(),
             render_fps: 30,
         }
@@ -288,26 +298,29 @@ impl MoshApp {
         });
     }
 
-    fn do_render(&mut self, output_path: PathBuf) {
+    fn start_render(&mut self, output_path: PathBuf, ctx: &egui::Context) {
         let indices = self.timeline.ordered_frame_indices();
         if indices.is_empty() {
             self.status = "Nothing on the timeline to render.".into();
             return;
         }
         self.status = format!("Rendering {} frames…", indices.len());
-        match export_video(
-            &indices,
-            &self.frame_store,
-            &mut self.decode_cache,
-            &output_path,
-            self.render_fps,
-        ) {
-            Ok(()) => {
-                self.status =
-                    format!("Rendered {} frames → {}", indices.len(), output_path.display())
-            }
-            Err(e) => self.status = format!("Render error: {e}"),
-        }
+        self.is_rendering = true;
+
+        // Snapshot what the thread needs — clone only the frame store.
+        let frame_store = self.frame_store.clone();
+        let fps = self.render_fps;
+        let tx = self.render_result_tx.clone();
+        let ctx = ctx.clone();
+
+        std::thread::spawn(move || {
+            let mut cache: Vec<Option<Arc<Yuv420>>> = vec![None; frame_store.len()];
+            let result = export_video(&indices, &frame_store, &mut cache, &output_path, fps)
+                .map(|()| format!("Rendered {} frames → {}", indices.len(), output_path.display()))
+                .map_err(|e| format!("Render error: {e}"));
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
     }
 
     // ── Preview ───────────────────────────────────────────────────────────────
@@ -394,11 +407,27 @@ impl eframe::App for MoshApp {
         }
 
         if let Ok(path) = self.render_rx.try_recv() {
-            self.do_render(path);
+            self.start_render(path, ctx);
         }
 
-        // Keep repainting while encoding so the status stays live.
-        if !self.encoding_clips.is_empty() {
+        match self.render_result_rx.try_recv() {
+            Ok(Ok(msg)) => {
+                self.status = msg;
+                self.is_rendering = false;
+            }
+            Ok(Err(e)) => {
+                self.status = e;
+                self.is_rendering = false;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.status = "Render thread crashed — check terminal for details.".into();
+                self.is_rendering = false;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        // Keep repainting while encoding or rendering so the status stays live.
+        if !self.encoding_clips.is_empty() || self.is_rendering {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
 
@@ -498,7 +527,12 @@ impl eframe::App for MoshApp {
                 ui.add(egui::DragValue::new(&mut self.render_fps).range(1..=120));
             });
             ui.add_space(4.0);
-            if ui
+            if self.is_rendering {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Rendering…");
+                });
+            } else if ui
                 .add_enabled(
                     !self.timeline.clips.is_empty(),
                     egui::Button::new("🎬 Render to file…"),
