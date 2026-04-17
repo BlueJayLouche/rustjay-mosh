@@ -4,44 +4,32 @@ use std::sync::{mpsc, Arc};
 use eframe::egui;
 use eframe::egui_wgpu;
 
-use crate::codec::encoder::encode_clip_as_ip;
-use crate::codec::ir::{Frame, FrameType, MacroblockSize, Yuv420};
+use crate::codec::ir::Yuv420;
 use crate::importer::import_video;
-use crate::pool::MediaPool;
-use crate::render::{decode_cached, export_video};
+use crate::packet::{build_sequence, ClipSpan, PacketClip};
+use crate::preview::decoder::PacketDecoder;
+use crate::render::muxer::export_packets;
 use crate::ui::preview::{YuvPreviewCallback, YuvResources};
 use crate::ui::timeline_panel::{next_clip_color, TimelineClip, TimelinePanel};
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-
-const KEYFRAME_INTERVAL: usize = 30;
-const ENCODE_SEARCH_RANGE: i16 = 8;
-
 // ── Background messages ────────────────────────────────────────────────────────
 
-/// Phase 1 (fast): raw decoded I-frames arrive so the clip can appear immediately.
-struct Phase1Result {
+struct ImportResult {
     name: String,
-    raw_yuv: Vec<Yuv420>,
-    store_offset: usize, // reserved slot in frame_store
+    packet_clip: PacketClip,
 }
 
-/// Phase 2 (slow): fully encoded I/P frames replace the placeholders.
-struct Phase2Result {
-    clip_idx: usize,
-    encoded: Vec<Frame>,
-    i_frame_indices: Vec<usize>,
-}
-
-/// Render thread result: success message or error string.
 type RenderResult = Result<String, String>;
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
 pub struct MoshApp {
-    pool: MediaPool,
-    frame_store: Vec<Frame>,
-    decode_cache: Vec<Option<Arc<Yuv420>>>,
+    packet_clips: Vec<PacketClip>,
+    packet_decoder: Option<PacketDecoder>,
+    /// Cache of the last decoded (playhead_frame, Yuv) to avoid re-decoding
+    /// when the playhead is stationary.
+    preview_cache: Option<(usize, Arc<Yuv420>)>,
+
     timeline: TimelinePanel,
     color_idx: usize,
     clip_uid: u64,
@@ -49,21 +37,14 @@ pub struct MoshApp {
     file_rx: mpsc::Receiver<PathBuf>,
     file_tx: mpsc::SyncSender<PathBuf>,
 
-    /// Phase 1: raw frames decoded by ffmpeg.
-    p1_rx: mpsc::Receiver<Result<Phase1Result, String>>,
-    p1_tx: mpsc::SyncSender<Result<Phase1Result, String>>,
-
-    /// Phase 2: encoded I/P frames ready to splice in.
-    p2_rx: mpsc::Receiver<Result<Phase2Result, String>>,
-    p2_tx: mpsc::SyncSender<Result<Phase2Result, String>>,
+    import_rx: mpsc::Receiver<Result<ImportResult, String>>,
+    import_tx: mpsc::SyncSender<Result<ImportResult, String>>,
 
     render_rx: mpsc::Receiver<PathBuf>,
     render_tx: mpsc::SyncSender<PathBuf>,
     render_result_rx: mpsc::Receiver<RenderResult>,
     render_result_tx: mpsc::SyncSender<RenderResult>,
 
-    /// Clips currently being P-frame encoded (show badge on timeline).
-    encoding_clips: Vec<usize>,
     is_rendering: bool,
     status: String,
     render_fps: u32,
@@ -78,28 +59,24 @@ impl MoshApp {
                 .insert(YuvResources::new(&ws.device, ws.target_format));
         }
         let (file_tx, file_rx) = mpsc::sync_channel(1);
-        let (p1_tx, p1_rx) = mpsc::sync_channel(1);
-        let (p2_tx, p2_rx) = mpsc::sync_channel(4);
+        let (import_tx, import_rx) = mpsc::sync_channel(4);
         let (render_tx, render_rx) = mpsc::sync_channel(1);
         let (render_result_tx, render_result_rx) = mpsc::sync_channel(1);
         Self {
-            pool: MediaPool::new(),
-            frame_store: vec![],
-            decode_cache: vec![],
+            packet_clips: vec![],
+            packet_decoder: None,
+            preview_cache: None,
             timeline: TimelinePanel::new(),
             color_idx: 0,
             clip_uid: 0,
             file_rx,
             file_tx,
-            p1_rx,
-            p1_tx,
-            p2_rx,
-            p2_tx,
+            import_rx,
+            import_tx,
             render_rx,
             render_tx,
             render_result_rx,
             render_result_tx,
-            encoding_clips: vec![],
             is_rendering: false,
             status: "Open a video file to begin.".into(),
             render_fps: 30,
@@ -122,33 +99,45 @@ impl MoshApp {
         });
     }
 
-    // ── Phase 1: decode with ffmpeg ───────────────────────────────────────────
+    // ── Import ────────────────────────────────────────────────────────────────
 
-    fn start_phase1(&mut self, path: PathBuf, ctx: &egui::Context) {
-        self.status = format!("Decoding {}…", path.display());
-        let store_offset = self.frame_store.len();
-        let tx = self.p1_tx.clone();
+    fn start_import(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.status = format!("Importing {}…", path.display());
+        let tx = self.import_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = run_phase1(path, store_offset);
+            let name = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let result = import_video(&path, &name)
+                .map(|(packet_clip, _first_yuv)| ImportResult {
+                    name,
+                    packet_clip,
+                })
+                .map_err(|e| format!("Import failed: {e}"));
             let _ = tx.send(result);
             ctx.request_repaint();
         });
     }
 
-    fn finish_phase1(&mut self, r: Phase1Result, ctx: &egui::Context) {
-        let frame_count = r.raw_yuv.len();
-        let store_offset = r.store_offset;
+    fn finish_import(&mut self, r: ImportResult, ctx: &egui::Context) {
+        let clip_idx = self.packet_clips.len();
+        self.packet_clips.push(r.packet_clip);
+        let packet_clip = &self.packet_clips[clip_idx];
+        let frame_count = packet_clip.packets.len();
 
-        // Immediately fill frame_store with I-frames so preview works.
-        for yuv in &r.raw_yuv {
-            self.frame_store.push(crate::codec::encoder::encode_iframe(
-                yuv.clone(),
-                self.frame_store.len() as u64,
-                MacroblockSize::Mb16x16,
-            ));
+        // Initialize decoder on first import.
+        if self.packet_decoder.is_none() {
+            match PacketDecoder::new(&packet_clip.codec_parameters) {
+                Ok(dec) => self.packet_decoder = Some(dec),
+                Err(e) => {
+                    self.status = format!("Decoder init failed: {e}");
+                    return;
+                }
+            }
         }
-        self.decode_cache.resize(self.frame_store.len(), None);
 
         let start_frame = self
             .timeline
@@ -158,62 +147,22 @@ impl MoshApp {
             .max()
             .unwrap_or(0);
 
-        let asset_id = self.pool.add_asset(
-            r.name.clone(),
-            MacroblockSize::Mb16x16,
-            vec![],
-        );
-
-        let clip_idx = self.timeline.clips.len();
         self.timeline.clips.push(TimelineClip {
             id: self.clip_uid,
-            asset_id,
+            clip_idx,
             name: r.name.clone(),
             frame_count,
-            encoded_range: store_offset..(store_offset + frame_count),
-            i_frame_indices: vec![0], // only the first frame is a keyframe for now
             start_frame,
             color: next_clip_color(self.color_idx),
             selected: false,
+            drop_leading_keyframe: false,
         });
         self.clip_uid += 1;
         self.color_idx += 1;
-        self.encoding_clips.push(clip_idx);
 
-        self.status = format!(
-            "'{}' on timeline — encoding P-frames in background…",
-            r.name
-        );
-
-        // Kick off phase 2.
-        let tx = self.p2_tx.clone();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let result = run_phase2(r.raw_yuv, store_offset, clip_idx);
-            let _ = tx.send(result);
-            ctx.request_repaint();
-        });
-    }
-
-    // ── Phase 2: encode I/P frames ────────────────────────────────────────────
-
-    fn finish_phase2(&mut self, r: Phase2Result) {
-        let clip = &self.timeline.clips[r.clip_idx];
-        let range = clip.encoded_range.clone();
-
-        // Replace I-frame placeholders with the properly encoded I/P frames.
-        for (i, frame) in r.encoded.into_iter().enumerate() {
-            self.frame_store[range.start + i] = frame;
-        }
-        self.decode_cache.fill(None);
-
-        self.timeline.clips[r.clip_idx].i_frame_indices = r.i_frame_indices;
-        self.encoding_clips.retain(|&i| i != r.clip_idx);
-
-        self.status = format!(
-            "'{}' fully encoded — mosh operations available.",
-            self.timeline.clips[r.clip_idx].name
-        );
+        self.status = format!("'{}' ready — {} frames.", r.name, frame_count);
+        self.preview_cache = None;
+        ctx.request_repaint();
     }
 
     // ── Mosh operations ───────────────────────────────────────────────────────
@@ -221,62 +170,21 @@ impl MoshApp {
     fn cross_clip_mosh(&mut self, b_idx: usize) {
         let clips = &self.timeline.clips;
         let clip_b_start = clips[b_idx].start_frame;
-        let clip_b_range = clips[b_idx].encoded_range.clone();
 
-        let a_last = match clips
+        let has_prev = clips
             .iter()
             .enumerate()
-            .filter(|(i, c)| *i != b_idx && c.end_frame() <= clip_b_start)
-            .max_by_key(|(_, c)| c.end_frame())
-        {
-            Some((_, a)) => a.encoded_range.end.saturating_sub(1),
-            None => {
-                self.status = "No preceding clip to mosh with.".into();
-                return;
-            }
-        };
+            .any(|(i, c)| i != b_idx && c.end_frame() <= clip_b_start);
 
-        let b_iframes = self.timeline.clips[b_idx].i_frame_indices.clone();
-        let mut rewired = 0;
-        for local_i in b_iframes {
-            let iframe_abs = clip_b_range.start + local_i;
-            let pframe_abs = iframe_abs + 1;
-            if pframe_abs < clip_b_range.end
-                && matches!(self.frame_store[pframe_abs].frame_type, FrameType::P)
-            {
-                self.frame_store[pframe_abs].reference = Some(a_last as u32);
-                rewired += 1;
-            }
+        if !has_prev {
+            self.status = "No preceding clip to mosh with.".into();
+            return;
         }
-        self.decode_cache.fill(None);
-        self.status = format!("Cross-clip mosh: rewired {rewired} boundary P-frame(s).");
-    }
 
-    fn remove_interior_iframes(&mut self, b_idx: usize) {
-        let range = self.timeline.clips[b_idx].encoded_range.clone();
-        let interior: Vec<usize> = self.timeline.clips[b_idx]
-            .i_frame_indices
-            .iter()
-            .copied()
-            .filter(|&l| l > 0)
-            .collect();
-
-        let mut removed = 0;
-        for local_i in &interior {
-            let iframe_abs = range.start + local_i;
-            let pframe_abs = iframe_abs + 1;
-            if pframe_abs < range.end
-                && matches!(self.frame_store[pframe_abs].frame_type, FrameType::P)
-            {
-                self.frame_store[pframe_abs].reference =
-                    Some((iframe_abs.saturating_sub(1)) as u32);
-                removed += 1;
-            }
-        }
-        self.timeline.clips[b_idx].i_frame_indices.retain(|&l| l == 0);
-        self.decode_cache.fill(None);
+        self.timeline.clips[b_idx].drop_leading_keyframe = true;
+        self.preview_cache = None;
         self.status = format!(
-            "Removed {removed} interior I-frame(s) from '{}'.",
+            "Cross-clip mosh: dropped leading keyframe of '{}'.",
             self.timeline.clips[b_idx].name
         );
     }
@@ -299,24 +207,58 @@ impl MoshApp {
     }
 
     fn start_render(&mut self, output_path: PathBuf, ctx: &egui::Context) {
-        let indices = self.timeline.ordered_frame_indices();
-        if indices.is_empty() {
+        let sorted = self.timeline.sorted_clips();
+        if sorted.is_empty() {
             self.status = "Nothing on the timeline to render.".into();
             return;
         }
-        self.status = format!("Rendering {} frames…", indices.len());
+
+        // Build a cloneable packet list for the render thread.
+        let mut render_packets: Vec<crate::packet::OwnedPacket> = Vec::new();
+        let mut pts_offset = 0i64;
+        for (i, clip) in sorted.iter().enumerate() {
+            let prev_ends = if i == 0 {
+                None
+            } else {
+                Some(sorted[i - 1].end_frame())
+            };
+            let can_drop = prev_ends.map_or(false, |end| end == clip.start_frame);
+            let drop = can_drop && clip.drop_leading_keyframe;
+            let packet_clip = &self.packet_clips[clip.clip_idx];
+            let start = if drop { 1 } else { 0 };
+            let mut first_pts = None;
+            for pkt in packet_clip.packets.iter().skip(start) {
+                let mut adjusted = pkt.clone();
+                if first_pts.is_none() {
+                    first_pts = Some(pkt.pts);
+                }
+                adjusted.pts = pkt.pts + pts_offset;
+                adjusted.dts = pkt.dts + pts_offset;
+                render_packets.push(adjusted);
+            }
+            if let (Some(first), Some(last)) =
+                (first_pts, packet_clip.packets.iter().skip(start).last())
+            {
+                pts_offset += last.pts + last.duration - first;
+            }
+        }
+
+        if render_packets.is_empty() {
+            self.status = "Nothing on the timeline to render.".into();
+            return;
+        }
+
+        self.status = format!("Rendering {} packets…", render_packets.len());
         self.is_rendering = true;
 
-        // Snapshot what the thread needs — clone only the frame store.
-        let frame_store = self.frame_store.clone();
-        let fps = self.render_fps;
         let tx = self.render_result_tx.clone();
         let ctx = ctx.clone();
+        let codec_params = self.packet_clips[0].codec_parameters.clone();
+        let time_base = self.packet_clips[0].time_base;
 
         std::thread::spawn(move || {
-            let mut cache: Vec<Option<Arc<Yuv420>>> = vec![None; frame_store.len()];
-            let result = export_video(&indices, &frame_store, &mut cache, &output_path, fps)
-                .map(|()| format!("Rendered {} frames → {}", indices.len(), output_path.display()))
+            let result = export_packets(&render_packets, &output_path, &codec_params, time_base)
+                .map(|()| format!("Rendered {} packets → {}", render_packets.len(), output_path.display()))
                 .map_err(|e| format!("Render error: {e}"));
             let _ = tx.send(result);
             ctx.request_repaint();
@@ -326,53 +268,57 @@ impl MoshApp {
     // ── Preview ───────────────────────────────────────────────────────────────
 
     fn current_preview_yuv(&mut self) -> Option<Arc<Yuv420>> {
-        let idx = self.timeline.store_index_at_playhead()?;
-        match decode_cached(idx, &self.frame_store, &mut self.decode_cache) {
-            Ok(yuv) => Some(yuv),
+        let (clip_idx, local_frame) = self.timeline.clip_at_playhead()?;
+        let global_frame = self.timeline.clips[..clip_idx]
+            .iter()
+            .filter(|c| c.start_frame < self.timeline.playhead)
+            .map(|c| c.frame_count)
+            .sum::<usize>()
+            + local_frame;
+
+        if let Some((cached_frame, cached_yuv)) = &self.preview_cache {
+            if *cached_frame == global_frame {
+                return Some(cached_yuv.clone());
+            }
+        }
+
+        // Build sequence without borrowing the whole self.
+        let sorted = self.timeline.sorted_clips();
+        let mut spans = Vec::with_capacity(sorted.len());
+        for (i, clip) in sorted.iter().enumerate() {
+            let prev_ends = if i == 0 {
+                None
+            } else {
+                Some(sorted[i - 1].end_frame())
+            };
+            let can_drop = prev_ends.map_or(false, |end| end == clip.start_frame);
+            let drop_leading_keyframe = can_drop && clip.drop_leading_keyframe;
+            spans.push(ClipSpan {
+                clip: &self.packet_clips[clip.clip_idx],
+                drop_leading_keyframe,
+            });
+        }
+        let sequence = build_sequence(&spans);
+        if sequence.is_empty() {
+            return None;
+        }
+
+        let decoder = self.packet_decoder.as_mut()?;
+        match decoder.decode_up_to(&sequence, global_frame) {
+            Ok(yuv) => {
+                self.preview_cache = Some((global_frame, yuv.clone()));
+                Some(yuv)
+            }
             Err(e) => {
                 self.status = format!("Decode error: {e}");
                 None
             }
         }
     }
-}
 
-// ── Background workers ────────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
-fn run_phase1(path: PathBuf, store_offset: usize) -> Result<Phase1Result, String> {
-    let name = path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
-    let (raw_frames, _w, _h) =
-        import_video(&path).map_err(|e| format!("Import failed: {e}"))?;
-    let raw_yuv: Vec<Yuv420> = raw_frames.into_iter().filter_map(|f| f.planes).collect();
-    Ok(Phase1Result { name, raw_yuv, store_offset })
-}
 
-fn run_phase2(
-    raw_yuv: Vec<Yuv420>,
-    store_offset: usize,
-    clip_idx: usize,
-) -> Result<Phase2Result, String> {
-    let mut local_store: Vec<Frame> = Vec::with_capacity(raw_yuv.len());
-    encode_clip_as_ip(
-        &raw_yuv,
-        MacroblockSize::Mb16x16,
-        ENCODE_SEARCH_RANGE,
-        KEYFRAME_INTERVAL,
-        store_offset as u64,
-        &mut local_store,
-        store_offset,
-    );
-    let i_frame_indices: Vec<usize> = local_store
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| matches!(f.frame_type, FrameType::I))
-        .map(|(i, _)| i)
-        .collect();
-    Ok(Phase2Result { clip_idx, encoded: local_store, i_frame_indices })
 }
 
 // ── eframe::App ───────────────────────────────────────────────────────────────
@@ -381,27 +327,14 @@ impl eframe::App for MoshApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ── Drain channels ────────────────────────────────────────────────────
         if let Ok(path) = self.file_rx.try_recv() {
-            self.start_phase1(path, ctx);
+            self.start_import(path, ctx);
         }
 
-        match self.p1_rx.try_recv() {
-            Ok(Ok(r)) => self.finish_phase1(r, ctx),
+        match self.import_rx.try_recv() {
+            Ok(Ok(r)) => self.finish_import(r, ctx),
             Ok(Err(e)) => self.status = e,
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.status = "Import thread crashed — check terminal for details.".into();
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-        }
-
-        match self.p2_rx.try_recv() {
-            Ok(Ok(r)) => self.finish_phase2(r),
-            Ok(Err(e)) => {
-                self.status = e;
-                self.encoding_clips.clear();
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.status = "Encoder thread crashed — check terminal for details.".into();
-                self.encoding_clips.clear();
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
@@ -426,8 +359,8 @@ impl eframe::App for MoshApp {
             Err(mpsc::TryRecvError::Empty) => {}
         }
 
-        // Keep repainting while encoding or rendering so the status stays live.
-        if !self.encoding_clips.is_empty() || self.is_rendering {
+        // Keep repainting while rendering so the status stays live.
+        if self.is_rendering {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
 
@@ -437,10 +370,10 @@ impl eframe::App for MoshApp {
                 if ui.button("➕ Import clip").clicked() {
                     self.open_file(ctx);
                 }
-                if !self.encoding_clips.is_empty() {
+                if self.is_rendering {
                     ui.separator();
                     ui.spinner();
-                    ui.label("Encoding…");
+                    ui.label("Rendering…");
                 }
                 ui.separator();
                 ui.label(&self.status);
@@ -456,15 +389,7 @@ impl eframe::App for MoshApp {
 
             if let Some(idx) = sel_idx {
                 let name = self.timeline.clips[idx].name.clone();
-                let encoding = self.encoding_clips.contains(&idx);
-
                 ui.label(format!("Selected: {name}"));
-                if encoding {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Encoding P-frames…");
-                    });
-                }
                 ui.add_space(6.0);
 
                 let has_prev = {
@@ -476,46 +401,29 @@ impl eframe::App for MoshApp {
                         .any(|(i, c)| i != idx && c.end_frame() <= start)
                 };
 
+                let already_moshed = self.timeline.clips[idx].drop_leading_keyframe;
+
                 if ui
                     .add_enabled(
-                        !encoding && has_prev,
+                        has_prev && !already_moshed,
                         egui::Button::new("⚡ Cross-clip mosh"),
                     )
                     .on_hover_text(
-                        "Rewire the first P-frame of this clip to reference\n\
-                         the last frame of the preceding clip.",
+                        "Drop the leading keyframe of this clip so that\n\
+                         its P-frames decode against the preceding clip.",
                     )
                     .clicked()
                 {
                     self.cross_clip_mosh(idx);
                 }
 
-                ui.add_space(4.0);
-
-                let has_interior = self.timeline.clips[idx]
-                    .i_frame_indices
-                    .iter()
-                    .any(|&l| l > 0);
-
-                if ui
-                    .add_enabled(
-                        !encoding && has_interior,
-                        egui::Button::new("🗑 Remove interior I-frames"),
-                    )
-                    .on_hover_text(
-                        "Bridge over interior keyframes so motion flows\n\
-                         continuously without resets.",
-                    )
-                    .clicked()
-                {
-                    self.remove_interior_iframes(idx);
+                if already_moshed {
+                    ui.label("Leading keyframe dropped.");
                 }
             } else {
                 ui.label("(no clip selected)");
                 ui.add_space(6.0);
                 ui.add_enabled(false, egui::Button::new("⚡ Cross-clip mosh"));
-                ui.add_space(4.0);
-                ui.add_enabled(false, egui::Button::new("🗑 Remove interior I-frames"));
             }
 
             ui.add_space(16.0);

@@ -16,4 +16,6 @@ ffmpeg-next = "8"
 eframe = { version = "0.29", features = ["wgpu"] }
 wgpu = "22"
 rfd = "0.15"
+rayon = "1"
+tempfile = "3"
 

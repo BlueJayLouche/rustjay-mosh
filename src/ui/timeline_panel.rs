@@ -1,5 +1,3 @@
-use std::ops::Range;
-
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
 // ── Palette ──────────────────────────────────────────────────────────────────
@@ -23,17 +21,17 @@ pub fn next_clip_color(idx: usize) -> Color32 {
 #[derive(Debug, Clone)]
 pub struct TimelineClip {
     pub id: u64,
-    pub asset_id: u32,
+    /// Index into the app's `packet_clips` vector.
+    pub clip_idx: usize,
     pub name: String,
     pub frame_count: usize,
-    /// Range of indices in the app's `frame_store` for this clip's encoded frames.
-    pub encoded_range: Range<usize>,
-    /// Local frame indices (relative to `encoded_range.start`) that are I-frames.
-    pub i_frame_indices: Vec<usize>,
     /// Timeline start position in *frame* units.
     pub start_frame: i64,
     pub color: Color32,
     pub selected: bool,
+    /// When true, the first keyframe of this clip is dropped on playback,
+    /// causing the decoder state to bleed in from the preceding clip.
+    pub drop_leading_keyframe: bool,
 }
 
 impl TimelineClip {
@@ -41,14 +39,12 @@ impl TimelineClip {
         self.start_frame + self.frame_count as i64
     }
 
-    /// Map a timeline-absolute frame to a `frame_store` index, if it falls
-    /// within this clip.
-    pub fn store_index_at(&self, timeline_frame: i64) -> Option<usize> {
+    /// Map a timeline-absolute frame to a local frame index inside this clip.
+    pub fn local_frame_at(&self, timeline_frame: i64) -> Option<usize> {
         if timeline_frame < self.start_frame || timeline_frame >= self.end_frame() {
             return None;
         }
-        let local = (timeline_frame - self.start_frame) as usize;
-        Some(self.encoded_range.start + local)
+        Some((timeline_frame - self.start_frame) as usize)
     }
 }
 
@@ -106,33 +102,34 @@ impl TimelinePanel {
         self.clips.iter().position(|c| c.selected)
     }
 
-    /// Collect `frame_store` indices for the full timeline in playhead order.
-    pub fn ordered_frame_indices(&self) -> Vec<usize> {
-        if self.clips.is_empty() {
-            return vec![];
-        }
-        let mut sorted = self.clips.clone();
-        sorted.sort_by_key(|c| c.start_frame);
+    /// Total timeline duration in frames.
+    pub fn total_frame_count(&self) -> usize {
+        self.clips
+            .iter()
+            .map(|c| c.end_frame())
+            .max()
+            .unwrap_or(0) as usize
+    }
 
-        let total: i64 = sorted.iter().map(|c| c.end_frame()).max().unwrap_or(0);
-        let mut out = Vec::with_capacity(total as usize);
-        for pos in 0..total {
-            if let Some(idx) = sorted.iter().find_map(|c| c.store_index_at(pos)) {
-                out.push(idx);
+    /// Return clips sorted by start_frame.
+    pub fn sorted_clips(&self) -> Vec<&TimelineClip> {
+        let mut sorted: Vec<_> = self.clips.iter().collect();
+        sorted.sort_by_key(|c| c.start_frame);
+        sorted
+    }
+
+    /// Find which clip (if any) contains the playhead and the local frame inside it.
+    pub fn clip_at_playhead(&self) -> Option<(usize, usize)> {
+        let ph = self.playhead;
+        for (i, clip) in self.clips.iter().enumerate() {
+            if let Some(local) = clip.local_frame_at(ph) {
+                return Some((i, local));
             }
         }
-        out
+        None
     }
 
-    /// Decode playhead position into a `frame_store` index.
-    pub fn store_index_at_playhead(&self) -> Option<usize> {
-        let ph = self.playhead;
-        let mut sorted = self.clips.clone();
-        sorted.sort_by_key(|c| c.start_frame);
-        sorted.iter().find_map(|c| c.store_index_at(ph))
-    }
-
-    /// Draw the timeline and handle interaction. Returns selected index and playhead.
+    /// Draw the timeline and handle interaction.
     pub fn show(&mut self, ui: &mut egui::Ui) -> TimelineResponse {
         const RULER_H: f32 = 20.0;
         const TRACK_H: f32 = 64.0;
@@ -183,7 +180,7 @@ impl TimelinePanel {
                     i.pointer.button_pressed(egui::PointerButton::Primary),
                     i.pointer.button_released(egui::PointerButton::Primary),
                     i.pointer.button_down(egui::PointerButton::Primary),
-                    i.pointer.delta(), // used for future velocity-based scroll
+                    i.pointer.delta(),
                     i.smooth_scroll_delta,
                     i.modifiers.ctrl,
                 )
@@ -273,28 +270,18 @@ impl TimelinePanel {
                 Pos2::new(cr.min(rect.right()), track_rect.bottom() - 2.0),
             );
 
-            painter.rect_filled(
-                clip_rect,
-                4.0,
-                if clip.selected {
-                    clip.color
-                } else {
-                    clip.color.gamma_multiply(0.8)
-                },
-            );
+            let base_color = if clip.selected {
+                clip.color
+            } else {
+                clip.color.gamma_multiply(0.8)
+            };
+            painter.rect_filled(clip_rect, 4.0, base_color);
 
-            // I-frame markers (red verticals)
-            for &local in &clip.i_frame_indices {
-                let x = self.frame_to_x(rect.left(), clip.start_frame + local as i64);
-                if x >= clip_rect.left() && x <= clip_rect.right() {
-                    painter.line_segment(
-                        [
-                            Pos2::new(x, clip_rect.top()),
-                            Pos2::new(x, clip_rect.bottom()),
-                        ],
-                        Stroke::new(1.5, Color32::from_rgb(240, 70, 70)),
-                    );
-                }
+            // Leading-keyframe drop indicator (cross-hatch the first few pixels)
+            if clip.drop_leading_keyframe && clip_rect.width() > 2.0 {
+                let hatch_w = 6.0f32.min(clip_rect.width());
+                let hatch_rect = Rect::from_min_size(clip_rect.min, Vec2::new(hatch_w, clip_rect.height()));
+                painter.rect_filled(hatch_rect, 4.0, Color32::from_rgba_premultiplied(0, 0, 0, 120));
             }
 
             // Border
@@ -357,7 +344,6 @@ impl TimelinePanel {
     }
 
     fn nice_step(&self) -> i64 {
-        // Pick a step size so ruler labels are at least ~40 px apart.
         let target_px = 40.0;
         let raw = target_px / self.zoom;
         let candidates = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000];

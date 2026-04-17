@@ -1,9 +1,11 @@
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 use ffmpeg_next as ffmpeg;
 use thiserror::Error;
 
-use crate::codec::ir::{Frame, FrameType, MacroblockSize, Yuv420};
+use crate::codec::ir::Yuv420;
+use crate::packet::{OwnedPacket, PacketClip};
 
 #[derive(Debug, Error)]
 pub enum ImportError {
@@ -11,80 +13,102 @@ pub enum ImportError {
     Ffmpeg(#[from] ffmpeg::Error),
     #[error("no video stream found in file")]
     NoVideoStream,
+    #[error("ffmpeg transcoding failed")]
+    TranscodeFailed,
+    #[error("i/o error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
-/// Decode every video frame from `path` into I-frames in the internal YUV420 IR.
-///
-/// Returns `(frames, width, height)`. All frames are stored as I-frames;
-/// call the encoder's `encode_pframe` afterwards to compress into P-frames.
-pub fn import_video(path: &Path) -> Result<(Vec<Frame>, u32, u32), ImportError> {
+/// Fixed project resolution. All clips are normalized to this size on import.
+const PROJECT_WIDTH: u32 = 1280;
+const PROJECT_HEIGHT: u32 = 720;
+
+/// Transcode the source video to a long-GOP H.264 file, read its packets,
+/// and return a `PacketClip` plus the first decoded YUV frame.
+pub fn import_video(path: &Path, name: impl Into<String>) -> Result<(PacketClip, Yuv420), ImportError> {
     ffmpeg::init()?;
 
-    let mut ictx = ffmpeg::format::input(path)?;
+    let temp_dir = tempfile::tempdir()?;
+    let temp_path = temp_dir.path().join("transcoded.mp4");
 
+    // 1. Transcode with ffmpeg CLI to guarantee one I-frame + all P-frames.
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i", path.to_str().unwrap_or(""),
+            "-vf", &format!("scale={}:{}", PROJECT_WIDTH, PROJECT_HEIGHT),
+            "-vcodec", "libx264",
+            "-g", "99999999",
+            "-bf", "0",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "faststart",
+            "-preset", "fast",
+            "-crf", "18",
+            temp_path.to_str().unwrap_or(""),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| ImportError::TranscodeFailed)?;
+
+    if !status.success() {
+        return Err(ImportError::TranscodeFailed);
+    }
+
+    // 2. Read packets from the transcoded file.
+    let mut ictx = ffmpeg::format::input(&temp_path)?;
     let stream = ictx
         .streams()
         .best(ffmpeg::media::Type::Video)
         .ok_or(ImportError::NoVideoStream)?;
     let stream_idx = stream.index();
+    let time_base = stream.time_base();
+    let codec_parameters = stream.parameters();
 
-    let codec_ctx =
-        ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
-    let mut decoder = codec_ctx.decoder().video()?;
-
-    let width = decoder.width();
-    let height = decoder.height();
-
-    let mut scaler = ffmpeg::software::scaling::Context::get(
-        decoder.format(),
-        width,
-        height,
-        ffmpeg::format::Pixel::YUV420P,
-        width,
-        height,
-        ffmpeg::software::scaling::Flags::BILINEAR,
-    )?;
-
-    let mut frames: Vec<Frame> = Vec::new();
-
-    let push_decoded = |decoder: &mut ffmpeg::decoder::Video,
-                            scaler: &mut ffmpeg::software::scaling::Context,
-                            frames: &mut Vec<Frame>|
-     -> Result<(), ImportError> {
-        let mut raw = ffmpeg::util::frame::video::Video::empty();
-        while decoder.receive_frame(&mut raw).is_ok() {
-            let mut yuv = ffmpeg::util::frame::video::Video::empty();
-            scaler.run(&raw, &mut yuv)?;
-            let pts = raw.pts().unwrap_or(frames.len() as i64) as u64;
-            frames.push(Frame {
-                frame_type: FrameType::I,
-                pts,
-                mb_size: MacroblockSize::Mb16x16,
-                reference: None,
-                planes: Some(copy_yuv(&yuv, width, height)),
-                motion_vectors: vec![],
-                residuals: vec![],
-            });
-        }
-        Ok(())
-    };
-
-    for (stream, packet) in ictx.packets() {
-        if stream.index() != stream_idx {
+    let mut packets: Vec<OwnedPacket> = Vec::new();
+    for (s, packet) in ictx.packets() {
+        if s.index() != stream_idx {
             continue;
         }
-        decoder.send_packet(&packet)?;
-        push_decoded(&mut decoder, &mut scaler, &mut frames)?;
+        let data = packet.data().unwrap_or(&[]).to_vec();
+        let is_key = packet.flags().contains(ffmpeg::codec::packet::Flags::KEY);
+        packets.push(OwnedPacket {
+            data,
+            pts: packet.pts().unwrap_or(0),
+            dts: packet.dts().unwrap_or(0),
+            duration: packet.duration(),
+            is_key,
+        });
     }
 
-    decoder.send_eof()?;
-    push_decoded(&mut decoder, &mut scaler, &mut frames)?;
+    // 3. Decode the first packet to grab dimensions and a preview frame.
+    let mut decoder = ffmpeg::codec::context::Context::from_parameters(codec_parameters.clone())?
+        .decoder()
+        .video()?;
+    let first_packet = ffmpeg::codec::packet::Packet::copy(&packets[0].data);
+    decoder.send_packet(&first_packet)?;
+    let mut frame = ffmpeg::util::frame::video::Video::empty();
+    decoder.receive_frame(&mut frame)?;
 
-    Ok((frames, width, height))
+    let yuv = copy_yuv_from_frame(&frame);
+
+    let clip = PacketClip {
+        id: 0, // caller will assign
+        name: name.into(),
+        packets,
+        width: PROJECT_WIDTH,
+        height: PROJECT_HEIGHT,
+        codec_parameters,
+        time_base,
+    };
+
+    Ok((clip, yuv))
 }
 
-/// Copy a YUV420P ffmpeg frame into our IR, stripping line padding.
-fn copy_yuv(frame: &ffmpeg::util::frame::video::Video, width: u32, height: u32) -> Yuv420 {
+fn copy_yuv_from_frame(frame: &ffmpeg::util::frame::video::Video) -> Yuv420 {
+    let width = frame.width();
+    let height = frame.height();
     let cw = (width / 2) as usize;
     let ch = (height / 2) as usize;
 

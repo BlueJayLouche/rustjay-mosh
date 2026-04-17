@@ -1,6 +1,6 @@
 # rustjay-mosh
 
-A pure-Rust datamoshing NLE (non-linear editor). Import video clips, place them on a timeline, rewire their I/P-frame reference graph to produce glitch-art motion-bleed effects, and render the result to MP4.
+A pure-Rust datamoshing NLE (non-linear editor). Import video clips, place them on a timeline, drop keyframes to produce glitch-art motion-bleed effects, and render the result to MP4 — all using native H.264 packet manipulation, no slow custom encoder.
 
 ![status: early development](https://img.shields.io/badge/status-early%20development-orange)
 
@@ -17,8 +17,8 @@ Datamoshing exploits this structure deliberately:
 
 | Technique | Effect |
 |---|---|
-| **I-frame removal** | Remove a keyframe so P-frames decode against stale content, causing pixels from a previous scene to "bleed" forward |
-| **Cross-clip mosh** | Rewire a P-frame's reference to point at the last frame of a *different* clip; that clip's motion vectors now drive the other clip's pixels |
+| **I-frame removal** | Drop a keyframe so P-frames decode against stale content, causing pixels from a previous scene to "bleed" forward |
+| **Cross-clip mosh** | Concatenate two clips and skip the leading keyframe of the second clip; its P-frames now drive the first clip's pixels |
 
 The result is the iconic "melting" or "smearing" glitch aesthetic found in music videos and experimental film.
 
@@ -26,14 +26,13 @@ The result is the iconic "melting" or "smearing" glitch aesthetic found in music
 
 ## Features
 
-- **FFmpeg importer** — open any format ffmpeg supports (mp4, mov, mkv, avi, webm, …)
-- **Internal I/P codec** — re-encodes each clip as an I/P sequence (keyframe every 30 frames by default) with YUV420 planar pixel format, 16×16 macroblocks, and full Y+U+V residuals
+- **FFmpeg importer** — open any format ffmpeg supports (mp4, mov, mkv, avi, webm, …). Each clip is transparently transcoded to a long-GOP H.264 intermediate with one I-frame and all P-frames.
+- **Packet-based datamoshing** — no custom software codec. We manipulate the raw H.264 packet stream directly, so output looks identical to professional tools like Supermosh.
+- **Fast import** — clips appear on the timeline instantly; no background P-frame encoding step.
 - **Interactive timeline** — drag clips, scrub the playhead, zoom with Ctrl+scroll
-- **I-frame markers** — red verticals on each clip block show every keyframe
-- **Cross-clip mosh** — one click rewires the boundary P-frames of the selected clip to reference the previous clip's last frame
-- **Interior I-frame removal** — bridges interior keyframes so motion flows continuously without resets
+- **Cross-clip mosh** — one click drops the leading keyframe of the selected clip so it bleeds into the preceding clip
 - **wgpu preview** — GPU-accelerated YUV→RGB display via a WGSL BT.601 shader; no CPU colour conversion
-- **Render to MP4** — pipes raw YUV420 frames to `ffmpeg -c:v libx264` at a configurable frame rate
+- **Render to MP4** — remuxes the manipulated packet stream directly to H.264 MP4 without re-encoding
 
 ---
 
@@ -57,8 +56,6 @@ cd rustjay-mosh
 cargo run --release
 ```
 
-A debug build works fine for short clips; use `--release` for longer ones (motion estimation is CPU-heavy).
-
 ---
 
 ## Usage
@@ -66,20 +63,17 @@ A debug build works fine for short clips; use `--release` for longer ones (motio
 ### Basic workflow
 
 1. **Import clips** — click **➕ Import clip** (repeat for each clip).  
-   Each clip is re-encoded into the internal I/P codec and placed end-to-end on the timeline.
+   Each clip is transcoded to a one-keyframe H.264 stream and placed end-to-end on the timeline.
 
 2. **Arrange** — drag clips to reorder them on the timeline.  
    The playhead scrubs the preview.
 
 3. **Cross-clip mosh** — select clip B, click **⚡ Cross-clip mosh**.  
-   Clip B's first P-frame (and every GOP boundary) is rewired to reference clip A's last frame.  
-   Clip A's pixels now morph through clip B's motion.
+   Clip B's leading I-frame is dropped; its P-frames now decode against clip A's pixels.  
+   Clip A's pixels morph through clip B's motion.
 
-4. **Remove interior I-frames** *(optional)* — click **🗑 Remove interior I-frames** on the selected clip.  
-   Interior keyframes are bridged over so the mosh effect doesn't reset every 30 frames.
-
-5. **Render** — set the output FPS, click **🎬 Render to file…**, choose an output path.  
-   Frames are decoded and piped to ffmpeg → H.264 MP4.
+4. **Render** — set the output FPS, click **🎬 Render to file…**, choose an output path.  
+   The packet sequence is rewritten with monotonic timestamps and remuxed to MP4.
 
 ### Timeline controls
 
@@ -99,103 +93,48 @@ A debug build works fine for short clips; use `--release` for longer ones (motio
 ┌─────────────────────────────────────────────────────────┐
 │                      rustjay-mosh                       │
 ├──────────────────┬────────────────┬─────────────────────┤
-│  importer        │  pool          │  codec              │
-│  (ffmpeg-next 8) │  (MediaPool)   │  ir / encoder /     │
-│                  │                │  decoder            │
+│  importer        │  packet        │  preview::decoder   │
+│  (ffmpeg CLI +   │  (OwnedPacket  │  (flush + seek      │
+│   ffmpeg-next)   │   · PacketClip │   decode)           │
 ├──────────────────┴────────────────┴─────────────────────┤
-│  frame_store: Vec<Frame>  (flat I/P encoded sequence)   │
-├─────────────────────────────────────────────────────────┤
-│  datamosh engine                                        │
-│  (cross_clip_mosh · remove_iframes · frame.reference    │
-│   mutation — no separate graph traversal needed)        │
+│  timeline_panel → ordered ClipSpans → flat packet seq   │
 ├──────────────────────────┬──────────────────────────────┤
-│  ui::timeline_panel      │  ui::preview                 │
-│  (egui painter widget)   │  (wgpu YUV callback)         │
-├──────────────────────────┴──────────────────────────────┤
-│  render (ffmpeg subprocess pipe → H.264 MP4)            │
-└─────────────────────────────────────────────────────────┘
+│  ui::preview             │  render::muxer               │
+│  (wgpu YUV callback)     │  (ffmpeg remux → MP4)        │
+└──────────────────────────┴──────────────────────────────┘
 ```
+
+### How it works
+
+1. **Import** runs `ffmpeg -g 99999999 -bf 0` to create an intermediate MP4 where only frame 0 is an I-frame.
+2. We read the encoded H.264 packets from that file and store them as `OwnedPacket` inside a `PacketClip`.
+3. The timeline builds a `ClipSpan` for each visible clip. If `drop_leading_keyframe` is true, the span skips the first packet (the I-frame).
+4. **Preview** flushes the ffmpeg decoder, feeds packets from the last keyframe up to the playhead, and returns the final decoded YUV frame.
+5. **Render** flattens all spans into a contiguous `Vec<OwnedPacket>`, rewrites PTS/DTS offsets so they are monotonic, and remuxes directly to MP4 with `av_interleaved_write_frame`.
 
 ### Module map
 
 | Path | Purpose |
 |---|---|
-| `codec::ir` | `Yuv420`, `Frame`, `MotionVector`, `Residual`, `MacroblockSize` |
-| `codec::encoder` | I-frame encoder, block-matching P-frame encoder, `encode_clip_as_ip` |
-| `codec::decoder` | Recursive P-frame decoder with full Y+U+V residual application |
-| `format::binary` | `.mosh` v0.2 binary format — `FileHeader`, `FrameTableEntry`, `RawMotionVector` |
-| `importer` | FFmpeg-based video importer → raw `Vec<Frame>` (all I-frames) |
-| `pool` | `MediaPool` — stores imported assets by id |
-| `frame_graph` | DAG of frame references (used for graph-level operations) |
-| `datamosh` | `remove_iframes`, `cross_clip_mosh` graph operations |
-| `render` | `export_video` → ffmpeg pipe, `decode_cached` |
+| `packet` | `OwnedPacket`, `PacketClip`, `ClipSpan`, `build_sequence` |
+| `preview::decoder` | `PacketDecoder` — flush + sequential decode up to any frame |
+| `render::muxer` | `export_packets` — remux packet slice to MP4 without re-encoding |
+| `importer` | FFmpeg transcode + packet extraction |
+| `frame_graph` | DAG of frame references (legacy data structure) |
+| `datamosh` | Graph-level operations (legacy, kept for reference) |
 | `ui::app` | `MoshApp` — eframe application, wires everything together |
-| `ui::timeline_panel` | `TimelinePanel` egui widget — clips, I-frame markers, drag, playhead |
+| `ui::timeline_panel` | `TimelinePanel` egui widget — clips, drag, playhead |
 | `ui::preview` | `YuvResources` + `YuvPreviewCallback` — wgpu YUV→RGB render pipeline |
 | `ui::shader.wgsl` | BT.601 YCbCr→RGB WGSL fragment shader |
-
----
-
-## Internal codec
-
-### Pixel format
-
-YUV420 planar throughout the pipeline:
-
-| Plane | Size |
-|---|---|
-| Y (luma) | `width × height` bytes |
-| U (Cb) | `(width/2) × (height/2)` bytes |
-| V (Cr) | `(width/2) × (height/2)` bytes |
-
-Macroblocks: fixed **16×16** per clip (8×8 also supported).
-
-### Residual layout
-
-Each macroblock residual is stored as a flat `Vec<i16>`:
-
-```
-[Y: mb×mb][U: cmb×cmb][V: cmb×cmb]   where cmb = mb/2
-```
-
-For 16×16 blocks: 256 + 64 + 64 = 384 values per macroblock.
-
-### Decoder algorithm
-
-```
-decode(frame, frame_store):
-  if I-frame:
-    return frame.planes
-  ref = decode(frame_store[frame.reference], frame_store)
-  for each macroblock (mv, residual):
-    Y:  sample ref.y at (block + mv),        add Y residual, clamp [0,255]
-    U:  sample ref.u at (block + mv/2),      add U residual, clamp [0,255]
-    V:  sample ref.v at (block + mv/2),      add V residual, clamp [0,255]
-  return output
-```
-
-Sampling clamps to edges (no wrap). `frame.reference` is mutated by mosh operations to create cross-clip prediction chains.
-
-### Binary format (`.mosh` v0.2, little-endian)
-
-```
-[Header 16B][Asset metadata][Frame Table N×32B][Frame Blocks…]
-```
-
-**Header**: `MOSH` magic · u16 major · u16 minor · u64 frame_count  
-**Frame table entry**: u64 offset · u64 size · u64 pts · u32 type · u32 reference  
-**Frame block**: `[MVs][Residuals][Planes (I only)]`  
-**Motion vector**: i16 dx · i16 dy · u16 bx · u16 by (8 bytes)
 
 ---
 
 ## Roadmap
 
 - [ ] Audio passthrough in render
-- [ ] GOP-size control per clip (currently fixed at 30)
 - [ ] Motion vector visualisation overlay
 - [ ] Waveform / thumbnail strip on timeline clips
-- [ ] Selective I-frame removal (click individual markers to remove)
+- [ ] Selective frame dropping / duplicating for advanced glitch effects
 - [ ] Export to formats other than H.264
 
 ---
