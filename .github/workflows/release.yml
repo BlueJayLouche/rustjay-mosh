@@ -70,8 +70,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # Download pre-built FFmpeg 7.x shared libs from BtbN builds
-          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip"
+          # ffmpeg-next 8.x targets FFmpeg 7.x; master builds are FFmpeg 8.x and have unhandled enum variants
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-lgpl-shared.zip"
           $zip = "$env:RUNNER_TEMP\ffmpeg.zip"
           $dir = "$env:RUNNER_TEMP\ffmpeg"
           Invoke-WebRequest $url -OutFile $zip
