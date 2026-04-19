@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: rustjay-mosh
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: rustjay-mosh
+
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: rustjay-mosh
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: rustjay-mosh.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.target }}-cargo-
+
+      # ── Linux ──────────────────────────────────────────────────────────────
+      - name: Install FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libavfilter-dev libavdevice-dev libswscale-dev \
+            libswresample-dev pkg-config
+
+      # ── macOS ──────────────────────────────────────────────────────────────
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg pkg-config
+
+      # ── Windows ────────────────────────────────────────────────────────────
+      - name: Install FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Download pre-built FFmpeg 7.x shared libs from BtbN builds
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip"
+          $zip = "$env:RUNNER_TEMP\ffmpeg.zip"
+          $dir = "$env:RUNNER_TEMP\ffmpeg"
+          Invoke-WebRequest $url -OutFile $zip
+          Expand-Archive $zip -DestinationPath $dir
+          $inner = Get-ChildItem $dir -Directory | Select-Object -First 1
+          echo "FFMPEG_DIR=$($inner.FullName)" >> $env:GITHUB_ENV
+          echo "$($inner.FullName)\bin" >> $env:GITHUB_PATH
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # ── Package artifacts ──────────────────────────────────────────────────
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf rustjay-mosh-${{ github.ref_name }}-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+          echo "ASSET=target/${{ matrix.target }}/release/rustjay-mosh-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" >> $GITHUB_ENV
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "rustjay-mosh-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Compress-Archive `
+            -Path "target\${{ matrix.target }}\release\${{ matrix.artifact }}" `
+            -DestinationPath $name
+          echo "ASSET=$name" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustjay-mosh-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
