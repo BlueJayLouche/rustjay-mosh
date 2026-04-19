@@ -69,12 +69,23 @@ jobs:
       - name: Install FFmpeg (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # ffmpeg-next 8.x targets FFmpeg 7.x; master builds are FFmpeg 8.x and have unhandled enum variants
-          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-lgpl-shared.zip"
+          # ffmpeg-next 8.x targets FFmpeg 7.x; BtbN n7.1 builds live in dated autobuild releases, not the "latest" tag
+          $releases = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases?per_page=30" `
+            -Headers @{ Authorization = "token $env:GH_TOKEN"; "User-Agent" = "gh-actions" }
+          $asset = $null
+          foreach ($r in $releases) {
+            $found = $r.assets | Where-Object { $_.name -match "ffmpeg-n7\.1-latest-win64-lgpl-shared.*\.zip" }
+            if ($found) { $asset = $found[0]; break }
+          }
+          if (-not $asset) { throw "Could not find FFmpeg n7.1 build in recent releases" }
+          Write-Host "Downloading $($asset.browser_download_url)"
           $zip = "$env:RUNNER_TEMP\ffmpeg.zip"
           $dir = "$env:RUNNER_TEMP\ffmpeg"
-          Invoke-WebRequest $url -OutFile $zip
+          Invoke-WebRequest $asset.browser_download_url -OutFile $zip
           Expand-Archive $zip -DestinationPath $dir
           $inner = Get-ChildItem $dir -Directory | Select-Object -First 1
           echo "FFMPEG_DIR=$($inner.FullName)" >> $env:GITHUB_ENV
