@@ -4,19 +4,20 @@ use std::sync::{mpsc, Arc};
 use eframe::egui::{self, CursorIcon};
 use eframe::egui_wgpu;
 
+use crate::audio::{import_audio, AudioClip, AudioTimelineClip};
 use crate::codec::ir::Yuv420;
 use crate::importer::import_video;
 use crate::packet::{build_sequence, ClipSpan, PacketClip};
 use crate::preview::decoder::PacketDecoder;
 use crate::render::muxer::export_packets;
 use crate::ui::preview::{YuvPreviewCallback, YuvResources};
-use crate::ui::timeline_panel::{next_clip_color, TimelineClip, TimelinePanel};
+use crate::ui::timeline_panel::{next_clip_color, PoolDragPayload, TimelineClip, TimelinePanel};
 
 // ── Background messages ────────────────────────────────────────────────────────
 
-struct ImportResult {
-    name: String,
-    packet_clip: PacketClip,
+enum ImportResult {
+    Video { name: String, packet_clip: PacketClip },
+    Audio { name: String, audio_clip: AudioClip },
 }
 
 type RenderResult = Result<String, String>;
@@ -25,9 +26,8 @@ type RenderResult = Result<String, String>;
 
 pub struct MoshApp {
     packet_clips: Vec<PacketClip>,
+    audio_clips: Vec<AudioClip>,
     packet_decoder: Option<PacketDecoder>,
-    /// Cache of the last decoded (playhead_frame, Yuv) to avoid re-decoding
-    /// when the playhead is stationary.
     preview_cache: Option<(usize, Arc<Yuv420>)>,
 
     timeline: TimelinePanel,
@@ -64,6 +64,7 @@ impl MoshApp {
         let (render_result_tx, render_result_rx) = mpsc::sync_channel(1);
         Self {
             packet_clips: vec![],
+            audio_clips: vec![],
             packet_decoder: None,
             preview_cache: None,
             timeline: TimelinePanel::new(),
@@ -78,7 +79,7 @@ impl MoshApp {
             render_result_rx,
             render_result_tx,
             is_rendering: false,
-            status: "Open a video file to begin.".into(),
+            status: "Open a video or audio file to begin.".into(),
             render_fps: 30,
         }
     }
@@ -91,6 +92,7 @@ impl MoshApp {
         std::thread::spawn(move || {
             if let Some(p) = rfd::FileDialog::new()
                 .add_filter("Video", &["mp4", "mov", "mkv", "avi", "webm", "m4v"])
+                .add_filter("Audio", &["wav", "mp3", "aac", "flac", "m4a", "ogg"])
                 .pick_file()
             {
                 let _ = tx.send(p);
@@ -105,64 +107,83 @@ impl MoshApp {
         self.status = format!("Importing {}…", path.display());
         let tx = self.import_tx.clone();
         let ctx = ctx.clone();
+        let fps = self.render_fps;
         std::thread::spawn(move || {
             let name = path
                 .file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
-            let result = import_video(&path, &name)
-                .map(|(packet_clip, _first_yuv)| ImportResult {
-                    name,
-                    packet_clip,
-                })
-                .map_err(|e| format!("Import failed: {e}"));
+
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            let is_audio = ["wav", "mp3", "aac", "flac", "m4a", "ogg"].contains(&ext.as_str());
+
+            let result = if is_audio {
+                import_audio(&path, &name, fps)
+                    .map(|audio_clip| ImportResult::Audio { name, audio_clip })
+                    .map_err(|e| format!("Audio import failed: {e}"))
+            } else {
+                import_video(&path, &name)
+                    .map(|(packet_clip, _first_yuv)| ImportResult::Video { name, packet_clip })
+                    .map_err(|e| format!("Video import failed: {e}"))
+            };
             let _ = tx.send(result);
             ctx.request_repaint();
         });
     }
 
     fn finish_import(&mut self, r: ImportResult, ctx: &egui::Context) {
-        let clip_idx = self.packet_clips.len();
-        self.packet_clips.push(r.packet_clip);
-        let packet_clip = &self.packet_clips[clip_idx];
-        let frame_count = packet_clip.packets.len();
+        match r {
+            ImportResult::Video { name, packet_clip } => {
+                let clip_idx = self.packet_clips.len();
+                self.packet_clips.push(packet_clip);
+                let frame_count = self.packet_clips[clip_idx].packets.len();
 
-        // Initialize decoder on first import.
-        if self.packet_decoder.is_none() {
-            match PacketDecoder::new(&packet_clip.codec_parameters) {
-                Ok(dec) => self.packet_decoder = Some(dec),
-                Err(e) => {
-                    self.status = format!("Decoder init failed: {e}");
-                    return;
+                if self.packet_decoder.is_none() {
+                    match PacketDecoder::new(&self.packet_clips[clip_idx].codec_parameters) {
+                        Ok(dec) => self.packet_decoder = Some(dec),
+                        Err(e) => {
+                            self.status = format!("Decoder init failed: {e}");
+                            return;
+                        }
+                    }
                 }
+
+                let start_frame = self.timeline.clips.iter().map(|c| c.end_frame()).max().unwrap_or(0);
+                self.timeline.clips.push(TimelineClip {
+                    id: self.clip_uid,
+                    clip_idx,
+                    name: name.clone(),
+                    frame_count,
+                    source_frame_count: frame_count,
+                    start_frame,
+                    source_offset: 0,
+                    color: next_clip_color(self.color_idx),
+                    selected: false,
+                    drop_leading_keyframe: false,
+                });
+                self.clip_uid += 1;
+                self.color_idx += 1;
+                self.status = format!("'{}' ready — {} frames.", name, frame_count);
+            }
+            ImportResult::Audio { name, audio_clip } => {
+                let frame_count = audio_clip.peaks.len();
+                self.audio_clips.push(audio_clip);
+                let clip_idx = self.audio_clips.len() - 1;
+
+                let start_frame = self.timeline.audio_clips.iter().map(|c| c.end_frame()).max().unwrap_or(0);
+                self.timeline.audio_clips.push(AudioTimelineClip {
+                    audio_clip_idx: clip_idx,
+                    start_frame,
+                    frame_count,
+                    source_offset: 0,
+                    fade_in_frames: 0,
+                    fade_out_frames: 0,
+                    selected: false,
+                });
+                self.status = format!("'{}' ready — {} frames audio.", name, frame_count);
             }
         }
-
-        let start_frame = self
-            .timeline
-            .clips
-            .iter()
-            .map(|c| c.end_frame())
-            .max()
-            .unwrap_or(0);
-
-        self.timeline.clips.push(TimelineClip {
-            id: self.clip_uid,
-            clip_idx,
-            name: r.name.clone(),
-            frame_count,
-            source_frame_count: frame_count,
-            start_frame,
-            source_offset: 0,
-            color: next_clip_color(self.color_idx),
-            selected: false,
-            drop_leading_keyframe: false,
-        });
-        self.clip_uid += 1;
-        self.color_idx += 1;
-
-        self.status = format!("'{}' ready — {} frames.", r.name, frame_count);
         self.preview_cache = None;
         ctx.request_repaint();
     }
@@ -185,16 +206,25 @@ impl MoshApp {
 
         let clip = &mut self.timeline.clips[b_idx];
         clip.drop_leading_keyframe = true;
-        // Shrinking by 1 frame keeps the timeline duration in sync with the
-        // actual packet count after the leading keyframe is dropped.
         if clip.frame_count > 1 {
             clip.frame_count -= 1;
         }
         self.preview_cache = None;
-        self.status = format!(
-            "Cross-clip mosh: dropped leading keyframe of '{}'.",
-            clip.name
-        );
+        self.status = format!("Cross-clip mosh: dropped leading keyframe of '{}'.", clip.name);
+    }
+
+    fn remove_selected_clips(&mut self) {
+        let before_v = self.timeline.clips.len();
+        let before_a = self.timeline.audio_clips.len();
+        self.timeline.clips.retain(|c| !c.selected);
+        self.timeline.audio_clips.retain(|c| !c.selected);
+        let removed_v = before_v - self.timeline.clips.len();
+        let removed_a = before_a - self.timeline.audio_clips.len();
+        if removed_v > 0 || removed_a > 0 {
+            self.timeline.validate_mosh_state();
+            self.preview_cache = None;
+            self.status = format!("Removed {removed_v} video clip(s), {removed_a} audio clip(s) from timeline.");
+        }
     }
 
     // ── Render ────────────────────────────────────────────────────────────────
@@ -221,15 +251,11 @@ impl MoshApp {
             return;
         }
 
-        // Build a cloneable packet list for the render thread.
+        // Build video packet list
         let mut render_packets: Vec<crate::packet::OwnedPacket> = Vec::new();
         let mut pts_offset = 0i64;
         for (i, clip) in sorted.iter().enumerate() {
-            let prev_ends = if i == 0 {
-                None
-            } else {
-                Some(sorted[i - 1].end_frame())
-            };
+            let prev_ends = if i == 0 { None } else { Some(sorted[i - 1].end_frame()) };
             let can_drop = prev_ends.map_or(false, |end| end == clip.start_frame);
             let drop = can_drop && clip.drop_leading_keyframe;
             let packet_clip = &self.packet_clips[clip.clip_idx];
@@ -254,18 +280,97 @@ impl MoshApp {
             return;
         }
 
-        self.status = format!("Rendering {} packets…", render_packets.len());
+        self.status = format!("Rendering {} video packets…", render_packets.len());
         self.is_rendering = true;
 
+        let fps = self.render_fps;
         let tx = self.render_result_tx.clone();
         let ctx = ctx.clone();
         let codec_params = self.packet_clips[0].codec_parameters.clone();
         let time_base = self.packet_clips[0].time_base;
+        let total_frames = self.timeline.total_frame_count();
+        let audio_sources = self.audio_clips.clone();
+        let audio_timeline: Vec<AudioTimelineClip> = self.timeline.audio_clips.clone();
 
         std::thread::spawn(move || {
-            let result = export_packets(&render_packets, &output_path, &codec_params, time_base)
-                .map(|()| format!("Rendered {} packets → {}", render_packets.len(), output_path.display()))
-                .map_err(|e| format!("Render error: {e}"));
+            let temp_dir = tempfile::tempdir().map_err(|e| format!("Temp dir error: {e}"));
+            let temp_dir = match temp_dir {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            let video_temp = temp_dir.path().join("video.mp4");
+
+            let video_result = export_packets(&render_packets, &video_temp, &codec_params, time_base);
+            if let Err(e) = video_result {
+                let _ = tx.send(Err(format!("Render error: {e}")));
+                ctx.request_repaint();
+                return;
+            }
+            let video_size = std::fs::metadata(&video_temp).map(|m| m.len()).unwrap_or(0);
+            if video_size == 0 {
+                let _ = tx.send(Err("Video temp file is empty after export.".into()));
+                ctx.request_repaint();
+                return;
+            }
+
+            let mut ffmpeg_args = vec![
+                "-y".to_string(),
+                "-i".to_string(), video_temp.to_string_lossy().into_owned(),
+            ];
+
+            if !audio_timeline.is_empty() {
+                let audio_temp = temp_dir.path().join("audio.wav");
+                if let Err(e) = crate::audio::render_audio_mix(
+                    &audio_sources,
+                    &audio_timeline,
+                    total_frames,
+                    fps,
+                    &audio_temp,
+                ) {
+                    let _ = tx.send(Err(format!("Audio mix error: {e}")));
+                    ctx.request_repaint();
+                    return;
+                }
+                ffmpeg_args.push("-i".to_string());
+                ffmpeg_args.push(audio_temp.to_string_lossy().into_owned());
+                ffmpeg_args.push("-map".to_string());
+                ffmpeg_args.push("0:v:0".to_string());
+                ffmpeg_args.push("-map".to_string());
+                ffmpeg_args.push("1:a:0".to_string());
+                ffmpeg_args.push("-c:v".to_string());
+                ffmpeg_args.push("copy".to_string());
+                ffmpeg_args.push("-c:a".to_string());
+                ffmpeg_args.push("aac".to_string());
+                ffmpeg_args.push("-b:a".to_string());
+                ffmpeg_args.push("192k".to_string());
+            } else {
+                ffmpeg_args.push("-c:v".to_string());
+                ffmpeg_args.push("copy".to_string());
+            }
+
+            ffmpeg_args.push(output_path.to_string_lossy().into_owned());
+
+            let ffmpeg_output = std::process::Command::new("ffmpeg")
+                .args(&ffmpeg_args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output();
+
+            let result = match ffmpeg_output {
+                Ok(out) if out.status.success() => {
+                    Ok(format!("Rendered {} packets → {}", render_packets.len(), output_path.display()))
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    Err(format!("ffmpeg muxing failed ({}): {stderr}", out.status))
+                }
+                Err(e) => Err(format!("ffmpeg launch failed: {e}")),
+            };
             let _ = tx.send(result);
             ctx.request_repaint();
         });
@@ -288,15 +393,10 @@ impl MoshApp {
             }
         }
 
-        // Build sequence without borrowing the whole self.
         let sorted = self.timeline.sorted_clips();
         let mut spans = Vec::with_capacity(sorted.len());
         for (i, clip) in sorted.iter().enumerate() {
-            let prev_ends = if i == 0 {
-                None
-            } else {
-                Some(sorted[i - 1].end_frame())
-            };
+            let prev_ends = if i == 0 { None } else { Some(sorted[i - 1].end_frame()) };
             let can_drop = prev_ends.map_or(false, |end| end == clip.start_frame);
             let drop_leading_keyframe = can_drop && clip.drop_leading_keyframe;
             spans.push(ClipSpan {
@@ -326,10 +426,8 @@ impl MoshApp {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    fn add_timeline_clip_from_pool(&mut self, pool_idx: usize, target_frame: i64) {
-        if pool_idx >= self.packet_clips.len() {
-            return;
-        }
+    fn add_video_from_pool(&mut self, pool_idx: usize, target_frame: i64) {
+        if pool_idx >= self.packet_clips.len() { return; }
         let packet_clip = &self.packet_clips[pool_idx];
         let frame_count = packet_clip.packets.len();
         let mut start_frame = target_frame.max(0);
@@ -351,6 +449,26 @@ impl MoshApp {
         self.color_idx += 1;
         self.preview_cache = None;
         self.timeline.clips.sort_by_key(|c| c.start_frame);
+    }
+
+    fn add_audio_from_pool(&mut self, pool_idx: usize, target_frame: i64) {
+        if pool_idx >= self.audio_clips.len() { return; }
+        let audio_clip = &self.audio_clips[pool_idx];
+        let frame_count = audio_clip.peaks.len();
+        let mut start_frame = target_frame.max(0);
+        start_frame = self.timeline.snap_start_frame(start_frame, frame_count, None);
+
+        self.timeline.audio_clips.push(AudioTimelineClip {
+            audio_clip_idx: pool_idx,
+            start_frame,
+            frame_count,
+            source_offset: 0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
+            selected: false,
+        });
+        self.preview_cache = None;
+        self.timeline.audio_clips.sort_by_key(|c| c.start_frame);
     }
 }
 
@@ -392,10 +510,16 @@ impl eframe::App for MoshApp {
             Err(mpsc::TryRecvError::Empty) => {}
         }
 
-        // Keep repainting while rendering so the status stays live.
         if self.is_rendering {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
+
+        // ── Keyboard shortcuts ────────────────────────────────────────────────
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::Delete) {
+                self.remove_selected_clips();
+            }
+        });
 
         // ── Top bar ───────────────────────────────────────────────────────────
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -417,20 +541,42 @@ impl eframe::App for MoshApp {
         egui::SidePanel::left("pool").min_width(160.0).show(ctx, |ui| {
             ui.heading("Clip Pool");
             ui.separator();
-            for (idx, clip) in self.packet_clips.iter().enumerate() {
-                let label = format!("{} ({}f)", clip.name, clip.packets.len());
-                let response = ui.dnd_drag_source(egui::Id::new(("pool", idx)), idx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("🎬");
-                        ui.label(&label);
-                    })
-                    .response
-                });
-                if response.inner.hovered() {
-                    ui.output_mut(|o| o.cursor_icon = CursorIcon::Grab);
+
+            if !self.packet_clips.is_empty() {
+                ui.label("Video");
+                for (idx, clip) in self.packet_clips.iter().enumerate() {
+                    let label = format!("{} ({}f)", clip.name, clip.packets.len());
+                    let response = ui.dnd_drag_source(egui::Id::new(("pool_v", idx)), PoolDragPayload::Video(idx), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("🎬");
+                            ui.label(&label);
+                        }).response
+                    });
+                    if response.inner.hovered() {
+                        ui.output_mut(|o| o.cursor_icon = CursorIcon::Grab);
+                    }
                 }
+                ui.add_space(8.0);
             }
-            if self.packet_clips.is_empty() {
+
+            if !self.audio_clips.is_empty() {
+                ui.label("Audio");
+                for (idx, clip) in self.audio_clips.iter().enumerate() {
+                    let label = format!("{} ({}f)", clip.name, clip.peaks.len());
+                    let response = ui.dnd_drag_source(egui::Id::new(("pool_a", idx)), PoolDragPayload::Audio(idx), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("🔊");
+                            ui.label(&label);
+                        }).response
+                    });
+                    if response.inner.hovered() {
+                        ui.output_mut(|o| o.cursor_icon = CursorIcon::Grab);
+                    }
+                }
+                ui.add_space(8.0);
+            }
+
+            if self.packet_clips.is_empty() && self.audio_clips.is_empty() {
                 ui.label("Import a clip to begin.");
             }
         });
@@ -440,7 +586,7 @@ impl eframe::App for MoshApp {
             ui.heading("Operations");
             ui.separator();
 
-            let sel_idx = self.timeline.selected_idx();
+            let sel_idx = self.timeline.selected_video_idx();
 
             if let Some(idx) = sel_idx {
                 let name = self.timeline.clips[idx].name.clone();
@@ -474,6 +620,11 @@ impl eframe::App for MoshApp {
 
                 if already_moshed {
                     ui.label("Leading keyframe dropped.");
+                }
+
+                ui.add_space(8.0);
+                if ui.button("🗑 Remove from timeline").clicked() {
+                    self.remove_selected_clips();
                 }
             } else {
                 ui.label("(no clip selected)");
@@ -524,13 +675,15 @@ impl eframe::App for MoshApp {
             .min_height(100.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
-                let tl_resp = self.timeline.show(ui);
+                let fps = self.render_fps;
+                let tl_resp = self.timeline.show(ui, fps, &self.audio_clips);
                 ui.add_space(4.0);
 
-                if let (Some(pool_idx), Some(drop_frame)) =
-                    (tl_resp.dropped_pool_idx, tl_resp.drop_frame)
-                {
-                    self.add_timeline_clip_from_pool(pool_idx, drop_frame);
+                if let (Some(payload), Some(drop_frame)) = (tl_resp.dropped_payload, tl_resp.drop_frame) {
+                    match payload {
+                        PoolDragPayload::Video(pool_idx) => self.add_video_from_pool(pool_idx, drop_frame),
+                        PoolDragPayload::Audio(pool_idx) => self.add_audio_from_pool(pool_idx, drop_frame),
+                    }
                 }
             });
 

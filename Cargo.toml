@@ -18,4 +18,5 @@ wgpu = "22"
 rfd = "0.15"
 rayon = "1"
 tempfile = "3"
+hound = "3"
 
