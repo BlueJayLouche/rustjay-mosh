@@ -1,7 +1,7 @@
 # Agent Briefing — rustjay-mosh
 
-> Last updated: 2026-04-17  
-> Current commit: `main` branch, post-audio-track merge
+> Last updated: 2026-04-20  
+> Current commit: `main` branch, post-CI-and-bundling work
 
 ## What is this?
 
@@ -112,6 +112,9 @@ Needs: Rust 1.85+, FFmpeg 8.x, GPU with Metal/Vulkan/DX12 support.
 ### ffmpeg mux stderr capture
 Previously stderr was sent to `/dev/null`. Now captured so ffmpeg errors (missing streams, codec issues) surface in the UI status bar.
 
+### Bundled ffmpeg binary
+Release builds bundle the `ffmpeg` CLI binary inside the package (macOS: `Contents/MacOS/ffmpeg`; Windows: `ffmpeg.exe` next to the exe). `crate::bundled_ffmpeg()` in `lib.rs` resolves the binary path — it checks for a sibling `ffmpeg` next to the current executable first, falling back to PATH. **All three call sites must use `crate::bundled_ffmpeg()`**: `importer/mod.rs`, `audio/mod.rs`, `ui/app.rs`. Never add a fourth `Command::new("ffmpeg")` directly.
+
 ### Audio clip drag modes
 Normal drag on audio clip edge = **trim** (same as video). Hold **Shift** + drag on left/right half = **fade in/out**.
 
@@ -140,4 +143,4 @@ Normal drag on audio clip edge = **trim** (same as video). Hold **Shift** + drag
 
 - Repo: `github.com:BlueJayLouche/rustjay-mosh.git`
 - Branch: `main`
-- No CI, no tests yet — manual smoke-test with `cargo run --release`
+- GitHub Actions release CI at `.github/workflows/release.yml` — triggers on `v*` tags, builds macOS ARM, Linux x86_64, Windows x86_64
