@@ -5,6 +5,7 @@ use eframe::egui::{self, CursorIcon};
 use eframe::egui_wgpu;
 
 use crate::audio::{import_audio, AudioClip, AudioTimelineClip};
+use crate::bake::{BendMode, CompressRegion, Effect, bake_segment};
 use crate::codec::ir::Yuv420;
 use crate::importer::import_video;
 use crate::packet::{build_sequence, ClipSpan, PacketClip};
@@ -48,6 +49,25 @@ pub struct MoshApp {
     is_rendering: bool,
     status: String,
     render_fps: u32,
+
+    // ── Glitch dialog state ───────────────────────────────────────────────
+    show_bend_dialog: bool,
+    bend_mode: usize,       // 0=ReverseScanlines, 1=Echo, 2=Bitcrush, 3=ByteSwap, 4=Xor, 5=Noise
+    bend_duration: usize,   // 0=1frame, 1=±5, 2=±15, 3=whole
+    bend_echo_delay: usize,
+    bend_echo_mix: f32,
+    bend_bitcrush_bits: u8,
+    bend_byteswap_stride: usize,
+    bend_xor_mask: u8,
+    bend_noise_amount: u8,
+
+    show_compress_dialog: bool,
+    compress_x: u32,
+    compress_y: u32,
+    compress_w: u32,
+    compress_h: u32,
+    compress_quality: u8,
+    compress_duration: usize,
 }
 
 impl MoshApp {
@@ -81,6 +101,24 @@ impl MoshApp {
             is_rendering: false,
             status: "Open a video or audio file to begin.".into(),
             render_fps: 30,
+
+            show_bend_dialog: false,
+            bend_mode: 0,
+            bend_duration: 0,
+            bend_echo_delay: 4,
+            bend_echo_mix: 0.5,
+            bend_bitcrush_bits: 4,
+            bend_byteswap_stride: 4,
+            bend_xor_mask: 0xFF,
+            bend_noise_amount: 32,
+
+            show_compress_dialog: false,
+            compress_x: 0,
+            compress_y: 0,
+            compress_w: 1280,
+            compress_h: 720,
+            compress_quality: 15,
+            compress_duration: 0,
         }
     }
 
@@ -224,6 +262,204 @@ impl MoshApp {
             self.timeline.validate_mosh_state();
             self.preview_cache = None;
             self.status = format!("Removed {removed_v} video clip(s), {removed_a} audio clip(s) from timeline.");
+        }
+    }
+
+    // ── Glitch dialogs ────────────────────────────────────────────────────────
+
+    fn show_bend_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_bend_dialog {
+            return;
+        }
+        let mut open = self.show_bend_dialog;
+        egui::Window::new("🌀 Data Bend")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Duration:");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.bend_duration, 0, "Current frame");
+                    ui.radio_value(&mut self.bend_duration, 1, "±5f");
+                    ui.radio_value(&mut self.bend_duration, 2, "±15f");
+                    ui.radio_value(&mut self.bend_duration, 3, "Whole clip");
+                });
+                ui.add_space(8.0);
+
+                ui.label("Mode:");
+                let modes = [
+                    "Reverse scanlines",
+                    "Echo",
+                    "Bitcrush",
+                    "Byte swap",
+                    "XOR mask",
+                    "Noise",
+                ];
+                egui::ComboBox::from_label("")
+                    .selected_text(modes[self.bend_mode.min(modes.len() - 1)])
+                    .show_ui(ui, |ui| {
+                        for (i, name) in modes.iter().enumerate() {
+                            ui.selectable_value(&mut self.bend_mode, i, *name);
+                        }
+                    });
+
+                match self.bend_mode {
+                    1 => {
+                        ui.horizontal(|ui| {
+                            ui.label("Delay:");
+                            ui.add(egui::DragValue::new(&mut self.bend_echo_delay).range(1..=64));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Mix:");
+                            ui.add(egui::Slider::new(&mut self.bend_echo_mix, 0.0..=1.0));
+                        });
+                    }
+                    2 => {
+                        ui.horizontal(|ui| {
+                            ui.label("Bits:");
+                            ui.add(egui::DragValue::new(&mut self.bend_bitcrush_bits).range(1..=8));
+                        });
+                    }
+                    3 => {
+                        ui.horizontal(|ui| {
+                            ui.label("Stride:");
+                            ui.add(egui::DragValue::new(&mut self.bend_byteswap_stride).range(2..=64));
+                        });
+                    }
+                    4 => {
+                        ui.horizontal(|ui| {
+                            ui.label("Mask:");
+                            ui.add(egui::DragValue::new(&mut self.bend_xor_mask).range(0..=255));
+                        });
+                    }
+                    5 => {
+                        ui.horizontal(|ui| {
+                            ui.label("Amount:");
+                            ui.add(egui::DragValue::new(&mut self.bend_noise_amount).range(1..=128));
+                        });
+                    }
+                    _ => {}
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
+                        self.apply_bake(Effect::Bend(self.bend_mode_from_state()));
+                        self.show_bend_dialog = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.show_bend_dialog = false;
+                    }
+                });
+            });
+        self.show_bend_dialog = open;
+    }
+
+    fn bend_mode_from_state(&self) -> BendMode {
+        match self.bend_mode {
+            0 => BendMode::ReverseScanlines,
+            1 => BendMode::Echo { delay: self.bend_echo_delay, mix: self.bend_echo_mix },
+            2 => BendMode::Bitcrush { bits: self.bend_bitcrush_bits },
+            3 => BendMode::ByteSwap { stride: self.bend_byteswap_stride },
+            4 => BendMode::Xor { mask: self.bend_xor_mask },
+            5 => BendMode::Noise { amount: self.bend_noise_amount },
+            _ => BendMode::ReverseScanlines,
+        }
+    }
+
+    fn show_compress_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_compress_dialog {
+            return;
+        }
+        let mut open = self.show_compress_dialog;
+        egui::Window::new("🗜 Compress Region")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Duration:");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.compress_duration, 0, "Current frame");
+                    ui.radio_value(&mut self.compress_duration, 1, "±5f");
+                    ui.radio_value(&mut self.compress_duration, 2, "±15f");
+                    ui.radio_value(&mut self.compress_duration, 3, "Whole clip");
+                });
+                ui.add_space(8.0);
+
+                ui.label("Region (x, y, w, h):");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut self.compress_x).range(0..=1280));
+                    ui.add(egui::DragValue::new(&mut self.compress_y).range(0..=720));
+                    ui.add(egui::DragValue::new(&mut self.compress_w).range(1..=1280));
+                    ui.add(egui::DragValue::new(&mut self.compress_h).range(1..=720));
+                });
+                ui.label("Quality (lower = more artifacts):");
+                ui.add(egui::Slider::new(&mut self.compress_quality, 1..=100));
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
+                        let region = CompressRegion {
+                            x: self.compress_x,
+                            y: self.compress_y,
+                            w: self.compress_w,
+                            h: self.compress_h,
+                            quality: self.compress_quality,
+                        };
+                        self.apply_bake(Effect::Compress(region));
+                        self.show_compress_dialog = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.show_compress_dialog = false;
+                    }
+                });
+            });
+        self.show_compress_dialog = open;
+    }
+
+    fn apply_bake(&mut self, effect: Effect) {
+        let Some(sel_idx) = self.timeline.selected_video_idx() else {
+            self.status = "No clip selected.".into();
+            return;
+        };
+
+        let tl_clip = &self.timeline.clips[sel_idx];
+        let source_clip = match self.packet_clips.get(tl_clip.clip_idx) {
+            Some(c) => c,
+            None => {
+                self.status = "Source clip not found.".into();
+                return;
+            }
+        };
+
+        let total_source = source_clip.packets.len();
+        let playhead_local = (self.timeline.playhead - tl_clip.start_frame)
+            .max(0) as usize
+            + tl_clip.source_offset;
+        let playhead_local = playhead_local.min(total_source.saturating_sub(1));
+
+        let duration = match &effect {
+            Effect::Bend(_) => self.bend_duration,
+            Effect::Compress(_) => self.compress_duration,
+        };
+
+        let (start, count) = match duration {
+            0 => (playhead_local, 1),
+            1 => (playhead_local.saturating_sub(5), 11.min(total_source - playhead_local.saturating_sub(5))),
+            2 => (playhead_local.saturating_sub(15), 31.min(total_source - playhead_local.saturating_sub(15))),
+            _ => (tl_clip.source_offset, tl_clip.frame_count),
+        };
+
+        match bake_segment(source_clip, start, count, effect, self.render_fps) {
+            Ok(clip) => {
+                let name = format!("{}_baked_{:02}", tl_clip.name, self.clip_uid);
+                self.clip_uid += 1;
+                self.packet_clips.push(PacketClip { name: name.clone(), ..clip });
+                self.status = format!("'{}' ready — {count} frames baked.", name);
+            }
+            Err(e) => {
+                self.status = format!("Bake failed: {e}");
+            }
         }
     }
 
@@ -626,10 +862,28 @@ impl eframe::App for MoshApp {
                 if ui.button("🗑 Remove from timeline").clicked() {
                     self.remove_selected_clips();
                 }
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.heading("Glitch");
+                ui.add_space(4.0);
+                if ui.button("🌀 Bend at playhead").clicked() {
+                    self.show_bend_dialog = true;
+                }
+                if ui.button("🗜 Compress region").clicked() {
+                    self.show_compress_dialog = true;
+                }
             } else {
                 ui.label("(no clip selected)");
                 ui.add_space(6.0);
                 ui.add_enabled(false, egui::Button::new("⚡ Cross-clip mosh"));
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.heading("Glitch");
+                ui.add_space(4.0);
+                ui.add_enabled(false, egui::Button::new("🌀 Bend at playhead"));
+                ui.add_enabled(false, egui::Button::new("🗜 Compress region"));
             }
 
             ui.add_space(16.0);
@@ -701,5 +955,9 @@ impl eframe::App for MoshApp {
                 });
             }
         });
+
+        // ── Glitch dialogs ────────────────────────────────────────────────────
+        self.show_bend_dialog(ctx);
+        self.show_compress_dialog(ctx);
     }
 }

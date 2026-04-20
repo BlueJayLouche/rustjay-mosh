@@ -80,6 +80,43 @@ impl PacketDecoder {
 
         last_yuv.map(Arc::new).ok_or(DecodeError::NoFrame)
     }
+
+    /// Decode all packets sequentially and return every frame.
+    /// More efficient than calling `decode_up_to` repeatedly because
+    /// the decoder is only flushed once at the start.
+    pub fn decode_all(
+        &mut self,
+        packets: &[&OwnedPacket],
+    ) -> Result<Vec<Arc<Yuv420>>, DecodeError> {
+        if packets.is_empty() {
+            return Ok(vec![]);
+        }
+
+        self.decoder.flush();
+        let mut frame = ffmpeg::util::frame::video::Video::empty();
+        let mut frames: Vec<Arc<Yuv420>> = Vec::with_capacity(packets.len());
+
+        for pkt in packets {
+            let mut packet = ffmpeg::codec::packet::Packet::copy(&pkt.data);
+            packet.set_pts(Some(pkt.pts));
+            packet.set_dts(Some(pkt.dts));
+            packet.set_duration(pkt.duration);
+            if pkt.is_key {
+                packet.set_flags(ffmpeg::codec::packet::Flags::KEY);
+            }
+            self.decoder.send_packet(&packet)?;
+            while self.decoder.receive_frame(&mut frame).is_ok() {
+                frames.push(Arc::new(copy_yuv_from_frame(&frame)));
+            }
+        }
+
+        self.decoder.send_eof()?;
+        while self.decoder.receive_frame(&mut frame).is_ok() {
+            frames.push(Arc::new(copy_yuv_from_frame(&frame)));
+        }
+
+        Ok(frames)
+    }
 }
 
 fn copy_yuv_from_frame(frame: &ffmpeg::util::frame::video::Video) -> Yuv420 {

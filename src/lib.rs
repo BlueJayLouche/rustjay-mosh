@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod bake;
 pub mod codec;
 pub mod datamosh;
 pub mod format;
