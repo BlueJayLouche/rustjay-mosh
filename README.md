@@ -51,6 +51,18 @@ The result is the iconic "melting" or "smearing" glitch aesthetic found in music
 
 ---
 
+## Download
+
+Pre-built binaries for macOS (ARM + Intel), Linux, and Windows are available on the [Releases](https://github.com/BlueJayLouche/rustjay-mosh/releases) page.
+
+> **macOS Gatekeeper warning** — because the app is not notarized, macOS will block it on first launch. After downloading and installing, run this once in Terminal:
+> ```sh
+> xattr -cr "/Applications/RustJay Mosh.app"
+> ```
+> Then open normally. Alternatively, go to **System Settings → Privacy & Security** and click **Open Anyway** after the first blocked attempt.
+
+---
+
 ## Building
 
 ```sh
