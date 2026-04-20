@@ -354,7 +354,7 @@ impl MoshApp {
 
             ffmpeg_args.push(output_path.to_string_lossy().into_owned());
 
-            let ffmpeg_output = std::process::Command::new("ffmpeg")
+            let ffmpeg_output = std::process::Command::new(crate::bundled_ffmpeg())
                 .args(&ffmpeg_args)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())

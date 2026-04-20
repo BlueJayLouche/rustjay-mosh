@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -20,19 +19,6 @@ pub enum ImportError {
     Io(#[from] std::io::Error),
 }
 
-/// Returns the path to the bundled `ffmpeg` binary if it lives next to the
-/// executable (macOS .app / Windows zip), otherwise falls back to PATH.
-fn bundled_ffmpeg() -> OsString {
-    if let Ok(mut path) = std::env::current_exe() {
-        path.pop();
-        let candidate = path.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
-        if candidate.exists() {
-            return candidate.into_os_string();
-        }
-    }
-    OsString::from("ffmpeg")
-}
-
 /// Fixed project resolution. All clips are normalized to this size on import.
 const PROJECT_WIDTH: u32 = 1280;
 const PROJECT_HEIGHT: u32 = 720;
@@ -46,7 +32,7 @@ pub fn import_video(path: &Path, name: impl Into<String>) -> Result<(PacketClip,
     let temp_path = temp_dir.path().join("transcoded.mp4");
 
     // 1. Transcode with ffmpeg CLI to guarantee one I-frame + all P-frames.
-    let status = Command::new(bundled_ffmpeg())
+    let status = Command::new(crate::bundled_ffmpeg())
         .args([
             "-y",
             "-i", path.to_str().unwrap_or(""),

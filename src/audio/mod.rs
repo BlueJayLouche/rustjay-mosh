@@ -56,7 +56,7 @@ pub fn import_audio(
     let temp_dir = tempfile::tempdir()?;
     let temp_path = temp_dir.path().join("audio.raw");
 
-    let status = std::process::Command::new("ffmpeg")
+    let status = std::process::Command::new(crate::bundled_ffmpeg())
         .args([
             "-y",
             "-i", path.to_str().unwrap_or(""),
