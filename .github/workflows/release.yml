@@ -95,8 +95,22 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       # ── Package artifacts ──────────────────────────────────────────────────
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      - name: Package (macOS .app + .dmg)
+        if: runner.os == 'macOS'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP="RustJay Mosh.app"
+          DMG="rustjay-mosh-${{ github.ref_name }}-${{ matrix.target }}.dmg"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} "$APP/Contents/MacOS/"
+          chmod +x "$APP/Contents/MacOS/"*
+          sed "s/VERSION/$VERSION/g" macos/Info.plist > "$APP/Contents/Info.plist"
+          codesign --force --deep -s - "$APP"
+          hdiutil create -volname "RustJay Mosh" -srcfolder "$APP" -ov -format UDZO "$DMG"
+          echo "ASSET=$DMG" >> $GITHUB_ENV
+
+      - name: Package (Linux .tar.gz)
+        if: runner.os == 'Linux'
         run: |
           cd target/${{ matrix.target }}/release
           tar -czf rustjay-mosh-${{ github.ref_name }}-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
