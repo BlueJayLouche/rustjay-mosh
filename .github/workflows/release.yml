@@ -100,11 +100,13 @@ jobs:
           DMG="rustjay-mosh-${{ github.ref_name }}-${{ matrix.target }}.dmg"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
           cp target/${{ matrix.target }}/release/${{ matrix.artifact }} "$APP/Contents/MacOS/"
+          cp "$(brew --prefix)/bin/ffmpeg" "$APP/Contents/MacOS/"
           chmod +x "$APP/Contents/MacOS/"*
           sed "s/VERSION/$VERSION/g" macos/Info.plist > "$APP/Contents/Info.plist"
-          # Bundle FFmpeg dylibs and rewrite load paths so the app is self-contained
+          # Bundle dylibs for both the app and the ffmpeg binary
           dylibbundler -od -b \
             -x "$APP/Contents/MacOS/${{ matrix.artifact }}" \
+            -x "$APP/Contents/MacOS/ffmpeg" \
             -d "$APP/Contents/Frameworks/" \
             -p @executable_path/../Frameworks/
           codesign --force --deep -s - "$APP"
@@ -126,7 +128,8 @@ jobs:
           $staging = "$env:RUNNER_TEMP\staging"
           New-Item -ItemType Directory -Path $staging | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\${{ matrix.artifact }}" $staging
-          # Bundle FFmpeg DLLs so the app runs without FFmpeg installed
+          # Bundle ffmpeg.exe and DLLs so the app is self-contained
+          Copy-Item "$env:FFMPEG_DIR\bin\ffmpeg.exe" $staging
           Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $staging
           Compress-Archive -Path "$staging\*" -DestinationPath $name
           echo "ASSET=$name" >> $env:GITHUB_ENV
