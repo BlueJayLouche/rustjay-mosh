@@ -98,13 +98,19 @@ jobs:
       - name: Package (macOS .app + .dmg)
         if: runner.os == 'macOS'
         run: |
+          brew install dylibbundler
           VERSION="${GITHUB_REF_NAME#v}"
           APP="RustJay Mosh.app"
           DMG="rustjay-mosh-${{ github.ref_name }}-${{ matrix.target }}.dmg"
-          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
           cp target/${{ matrix.target }}/release/${{ matrix.artifact }} "$APP/Contents/MacOS/"
           chmod +x "$APP/Contents/MacOS/"*
           sed "s/VERSION/$VERSION/g" macos/Info.plist > "$APP/Contents/Info.plist"
+          # Bundle FFmpeg dylibs and rewrite load paths so the app is self-contained
+          dylibbundler -od -b \
+            -x "$APP/Contents/MacOS/${{ matrix.artifact }}" \
+            -d "$APP/Contents/Frameworks/" \
+            -p @executable_path/../Frameworks/
           codesign --force --deep -s - "$APP"
           hdiutil create -volname "RustJay Mosh" -srcfolder "$APP" -ov -format UDZO "$DMG"
           echo "ASSET=$DMG" >> $GITHUB_ENV
