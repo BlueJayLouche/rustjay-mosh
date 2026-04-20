@@ -24,10 +24,6 @@ jobs:
             target: aarch64-apple-darwin
             artifact: rustjay-mosh
 
-          - os: macos-13
-            target: x86_64-apple-darwin
-            artifact: rustjay-mosh
-
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: rustjay-mosh.exe
@@ -127,9 +123,12 @@ jobs:
         shell: pwsh
         run: |
           $name = "rustjay-mosh-${{ github.ref_name }}-${{ matrix.target }}.zip"
-          Compress-Archive `
-            -Path "target\${{ matrix.target }}\release\${{ matrix.artifact }}" `
-            -DestinationPath $name
+          $staging = "$env:RUNNER_TEMP\staging"
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\${{ matrix.artifact }}" $staging
+          # Bundle FFmpeg DLLs so the app runs without FFmpeg installed
+          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $staging
+          Compress-Archive -Path "$staging\*" -DestinationPath $name
           echo "ASSET=$name" >> $env:GITHUB_ENV
 
       - name: Upload artifact

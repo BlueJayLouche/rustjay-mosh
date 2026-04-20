@@ -55,6 +55,8 @@ The result is the iconic "melting" or "smearing" glitch aesthetic found in music
 
 Pre-built binaries for macOS (ARM + Intel), Linux, and Windows are available on the [Releases](https://github.com/BlueJayLouche/rustjay-mosh/releases) page.
 
+> **Linux** — the binary dynamically links against FFmpeg. Install it first: `sudo apt install ffmpeg` (Debian/Ubuntu) or the equivalent for your distro.
+
 > **macOS Gatekeeper warning** — because the app is not notarized, macOS will block it on first launch. After downloading and installing, run this once in Terminal:
 > ```sh
 > xattr -cr "/Applications/RustJay Mosh.app"
