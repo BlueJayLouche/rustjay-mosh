@@ -38,6 +38,10 @@ pub fn export_packets(
 
     octx.write_header()?;
 
+    // MP4 may override our requested time_base with its own timescale.
+    // Read back the actual stream tb after write_header and rescale into it.
+    let stream_tb = octx.stream(ost_index).ok_or(MuxerError::NoVideoStream)?.time_base();
+
     for pkt in packets {
         let mut packet = ffmpeg::codec::packet::Packet::copy(&pkt.data);
         if pkt.is_key {
@@ -47,6 +51,7 @@ pub fn export_packets(
         packet.set_pts(Some(pkt.pts));
         packet.set_dts(Some(pkt.dts));
         packet.set_duration(pkt.duration);
+        packet.rescale_ts(time_base, stream_tb);
         packet.set_stream(ost_index);
         packet.set_position(-1);
 

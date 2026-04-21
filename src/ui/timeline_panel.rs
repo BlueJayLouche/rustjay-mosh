@@ -51,6 +51,8 @@ pub struct TimelineClip {
     /// When true, the first visible keyframe of this clip is dropped on playback,
     /// causing the decoder state to bleed in from the preceding clip.
     pub drop_leading_keyframe: bool,
+    /// Video track index. 0 = top (render priority), 1 = bottom.
+    pub track: u8,
 }
 
 impl TimelineClip {
@@ -84,6 +86,9 @@ pub struct TimelineResponse {
     pub drop_frame: Option<i64>,
     /// True if the drop landed in the audio lane.
     pub drop_is_audio: bool,
+    /// Video track the drop landed on (0 = top, 1 = bottom). Only meaningful
+    /// when `drop_is_audio` is false.
+    pub drop_track: u8,
 }
 
 // ── Widget ───────────────────────────────────────────────────────────────────
@@ -129,6 +134,11 @@ pub struct TimelinePanel {
     scroll_offset: f32,
     drag: Option<DragState>,
     next_id: u64,
+    /// Inclusive-exclusive selection range in timeline frames. Used as the
+    /// effect-application range when present.
+    pub selection: Option<(i64, i64)>,
+    /// Anchor frame while the user is dragging a new selection on the ruler.
+    ruler_drag_anchor: Option<i64>,
 }
 
 impl Default for TimelinePanel {
@@ -147,7 +157,13 @@ impl TimelinePanel {
             scroll_offset: 0.0,
             drag: None,
             next_id: 0,
+            selection: None,
+            ruler_drag_anchor: None,
         }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
     }
 
     pub fn next_id(&mut self) -> u64 {
@@ -184,9 +200,15 @@ impl TimelinePanel {
 
     pub fn clip_at_playhead(&self) -> Option<(usize, usize)> {
         let ph = self.playhead;
-        for (i, clip) in self.clips.iter().enumerate() {
-            if let Some(local) = clip.local_frame_at(ph) {
-                return Some((i, local));
+        // Top track has render priority, then fall through to bottom.
+        for track in 0..=1u8 {
+            for (i, clip) in self.clips.iter().enumerate() {
+                if clip.track != track {
+                    continue;
+                }
+                if let Some(local) = clip.local_frame_at(ph) {
+                    return Some((i, local));
+                }
             }
         }
         None
@@ -194,7 +216,8 @@ impl TimelinePanel {
 
     pub fn show(&mut self, ui: &mut egui::Ui, fps: u32, audio_sources: &[AudioClip]) -> TimelineResponse {
         const RULER_H: f32 = 22.0;
-        const VIDEO_H: f32 = 64.0;
+        const TRACK_H: f32 = 34.0;
+        const VIDEO_H: f32 = TRACK_H * 2.0;
         const AUDIO_H: f32 = 48.0;
         const TOTAL_H: f32 = RULER_H + VIDEO_H + AUDIO_H;
         const HANDLE_W: f32 = 8.0;
@@ -211,6 +234,16 @@ impl TimelinePanel {
             Pos2::new(rect.left(), rect.top() + RULER_H),
             Pos2::new(rect.right(), rect.top() + RULER_H + VIDEO_H),
         );
+        let track_rects = [
+            Rect::from_min_max(
+                Pos2::new(video_rect.left(), video_rect.top()),
+                Pos2::new(video_rect.right(), video_rect.top() + TRACK_H),
+            ),
+            Rect::from_min_max(
+                Pos2::new(video_rect.left(), video_rect.top() + TRACK_H),
+                Pos2::new(video_rect.right(), video_rect.bottom()),
+            ),
+        ];
         let audio_rect = Rect::from_min_max(
             Pos2::new(rect.left(), rect.top() + RULER_H + VIDEO_H),
             rect.max,
@@ -219,8 +252,67 @@ impl TimelinePanel {
         // Backgrounds
         painter.rect_filled(rect, 0.0, Color32::from_gray(28));
         painter.rect_filled(ruler_rect, 0.0, Color32::from_gray(45));
-        painter.rect_filled(video_rect, 0.0, Color32::from_gray(33));
+        painter.rect_filled(track_rects[0], 0.0, Color32::from_gray(36));
+        painter.rect_filled(track_rects[1], 0.0, Color32::from_gray(30));
+        // 1px divider between the two video tracks
+        painter.line_segment(
+            [
+                Pos2::new(video_rect.left(), video_rect.top() + TRACK_H),
+                Pos2::new(video_rect.right(), video_rect.top() + TRACK_H),
+            ],
+            Stroke::new(1.0, Color32::from_gray(20)),
+        );
         painter.rect_filled(audio_rect, 0.0, Color32::from_gray(38));
+
+        // Track labels
+        painter.text(
+            Pos2::new(video_rect.left() + 4.0, track_rects[0].top() + 2.0),
+            egui::Align2::LEFT_TOP,
+            "V1",
+            FontId::monospace(9.0),
+            Color32::from_gray(180),
+        );
+        painter.text(
+            Pos2::new(video_rect.left() + 4.0, track_rects[1].top() + 2.0),
+            egui::Align2::LEFT_TOP,
+            "V2",
+            FontId::monospace(9.0),
+            Color32::from_gray(180),
+        );
+
+        // Selection band — painted under clips so clip bodies stay readable.
+        if let Some((sel_a, sel_b)) = self.selection {
+            let x1 = self.frame_to_x(rect.left(), sel_a);
+            let x2 = self.frame_to_x(rect.left(), sel_b);
+            let lx = x1.min(x2).max(rect.left());
+            let rx = x1.max(x2).min(rect.right());
+            if rx > lx {
+                let band = Rect::from_min_max(
+                    Pos2::new(lx, video_rect.top()),
+                    Pos2::new(rx, audio_rect.bottom()),
+                );
+                painter.rect_filled(
+                    band,
+                    0.0,
+                    Color32::from_rgba_premultiplied(255, 210, 0, 36),
+                );
+                // Top ribbon inside the ruler
+                let ribbon = Rect::from_min_max(
+                    Pos2::new(lx, ruler_rect.top() + 2.0),
+                    Pos2::new(rx, ruler_rect.top() + 6.0),
+                );
+                painter.rect_filled(ribbon, 0.0, Color32::from_rgb(255, 210, 0));
+                // Vertical edges
+                painter.line_segment(
+                    [Pos2::new(lx, ruler_rect.top()), Pos2::new(lx, audio_rect.bottom())],
+                    Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 210, 0, 180)),
+                );
+                painter.line_segment(
+                    [Pos2::new(rx, ruler_rect.top()), Pos2::new(rx, audio_rect.bottom())],
+                    Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 210, 0, 180)),
+                );
+            }
+        }
 
         // ── Ruler ────────────────────────────────────────────────────────────
         let step = self.nice_step(fps);
@@ -252,25 +344,6 @@ impl TimelinePanel {
             f += step;
         }
 
-        // ── Zoom buttons ─────────────────────────────────────────────────────
-        let btn_h = 18.0;
-        let btn_w = 22.0;
-        let btn_rect = Rect::from_min_size(
-            Pos2::new(ruler_rect.right() - btn_w * 2.0 - 6.0, ruler_rect.top() + 2.0),
-            Vec2::new(btn_w * 2.0 + 2.0, btn_h),
-        );
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(btn_rect), |ui| {
-            ui.horizontal(|ui| {
-                ui.style_mut().spacing.button_padding = Vec2::new(4.0, 0.0);
-                if ui.add_sized([btn_w, btn_h], egui::Button::new("−")).clicked() {
-                    self.zoom = (self.zoom * 0.75).clamp(0.5, 500.0);
-                }
-                if ui.add_sized([btn_w, btn_h], egui::Button::new("+")).clicked() {
-                    self.zoom = (self.zoom * 1.3333).clamp(0.5, 500.0);
-                }
-            });
-        });
-
         // ── Input ────────────────────────────────────────────────────────────
         let (pointer_pos, pressed, released, down, _p_delta, scroll, ctrl, shift) = ui.input(|i| {
             (
@@ -287,7 +360,10 @@ impl TimelinePanel {
 
         if pointer_pos.map_or(false, |p| rect.contains(p)) {
             if ctrl {
-                self.zoom = (self.zoom + scroll.y * 0.15).clamp(0.5, 500.0);
+                // Multiplicative step so ctrl-scroll feels smooth across the
+                // full log range (0.02 ≈ 10 min in a 600px view, up to 500).
+                let factor = (1.0 + scroll.y * 0.01).clamp(0.5, 2.0);
+                self.zoom = (self.zoom * factor).clamp(0.02, 500.0);
             } else {
                 self.scroll_offset = (self.scroll_offset - scroll.x - scroll.y).max(0.0);
             }
@@ -297,17 +373,19 @@ impl TimelinePanel {
         let dropped_payload = timeline_response
             .dnd_release_payload::<PoolDragPayload>()
             .map(|arc| *arc);
-        let (drop_frame, drop_is_audio) = if let (Some(_), Some(pos)) = (dropped_payload, pointer_pos) {
-            if rect.contains(pos) {
-                let frame = self.x_to_frame(rect.left(), pos.x).max(0);
-                let is_audio = audio_rect.contains(pos);
-                (Some(frame), is_audio)
+        let (drop_frame, drop_is_audio, drop_track) =
+            if let (Some(_), Some(pos)) = (dropped_payload, pointer_pos) {
+                if rect.contains(pos) {
+                    let frame = self.x_to_frame(rect.left(), pos.x).max(0);
+                    let is_audio = audio_rect.contains(pos);
+                    let track: u8 = if track_rects[1].contains(pos) { 1 } else { 0 };
+                    (Some(frame), is_audio, track)
+                } else {
+                    (None, false, 0)
+                }
             } else {
-                (None, false)
-            }
-        } else {
-            (None, false)
-        };
+                (None, false, 0)
+            };
 
         // ── Hit-test ─────────────────────────────────────────────────────────
         let mut clicked_video: Option<usize> = None;
@@ -315,12 +393,40 @@ impl TimelinePanel {
         let mut clicked_background = false;
         let mut hovered_edge = false;
 
+        // Ruler drag selection — update before the clip hit-test block so a
+        // drag that started on the ruler keeps going even if the pointer
+        // leaves it.
+        if let Some(pos) = pointer_pos {
+            if pressed && ruler_rect.contains(pos) {
+                let f = self.x_to_frame(rect.left(), pos.x).max(0);
+                self.playhead = f;
+                self.selection = None;
+                self.ruler_drag_anchor = Some(f);
+            } else if down && self.ruler_drag_anchor.is_some() {
+                let anchor = self.ruler_drag_anchor.unwrap();
+                let cur = self.x_to_frame(rect.left(), pos.x).max(0);
+                if cur != anchor {
+                    let (lo, hi) = if cur >= anchor { (anchor, cur) } else { (cur, anchor) };
+                    self.selection = Some((lo, hi));
+                    self.playhead = cur;
+                }
+            }
+        }
+        if released && self.ruler_drag_anchor.take().is_some() {
+            // A plain click with no drag leaves `selection` as None, which is
+            // the right state. Nothing else to do.
+        }
+
         if let Some(pos) = pointer_pos {
             if pressed {
                 if ruler_rect.contains(pos) {
-                    self.playhead = self.x_to_frame(rect.left(), pos.x).max(0);
+                    // Already handled above — playhead + selection set.
                 } else if video_rect.contains(pos) {
+                    let hit_track: u8 = if track_rects[1].contains(pos) { 1 } else { 0 };
                     for (i, clip) in self.clips.iter().enumerate() {
+                        if clip.track != hit_track {
+                            continue;
+                        }
                         let cl = self.frame_to_x(rect.left(), clip.start_frame);
                         let cr = self.frame_to_x(rect.left(), clip.end_frame());
                         if pos.x >= cl && pos.x <= cr {
@@ -404,7 +510,11 @@ impl TimelinePanel {
             } else {
                 // hover cursor feedback
                 if video_rect.contains(pos) {
+                    let hit_track: u8 = if track_rects[1].contains(pos) { 1 } else { 0 };
                     for clip in &self.clips {
+                        if clip.track != hit_track {
+                            continue;
+                        }
                         let cl = self.frame_to_x(rect.left(), clip.start_frame);
                         let cr = self.frame_to_x(rect.left(), clip.end_frame());
                         if pos.x >= cl && pos.x <= cr {
@@ -542,9 +652,10 @@ impl TimelinePanel {
             let cr = self.frame_to_x(rect.left(), clip.end_frame());
             if cr < rect.left() || cl > rect.right() { continue; }
 
+            let tr = track_rects[(clip.track as usize).min(1)];
             let clip_rect = Rect::from_min_max(
-                Pos2::new(cl.max(rect.left()), video_rect.top() + 2.0),
-                Pos2::new(cr.min(rect.right()), video_rect.bottom() - 2.0),
+                Pos2::new(cl.max(rect.left()), tr.top() + 2.0),
+                Pos2::new(cr.min(rect.right()), tr.bottom() - 2.0),
             );
 
             let base_color = if clip.selected { clip.color } else { clip.color.gamma_multiply(0.8) };
@@ -696,6 +807,7 @@ impl TimelinePanel {
             dropped_payload,
             drop_frame,
             drop_is_audio,
+            drop_track,
         }
     }
 
@@ -765,16 +877,30 @@ impl TimelinePanel {
         new_start
     }
 
-    /// Disable cross-clip mosh on any clip that is no longer immediately
-    /// preceded by another clip, and restore its frame count.
+    /// True if some other clip (on any track) covers the timeline frame
+    /// `start_frame - 1` — i.e. the decoder will have produced output there,
+    /// so this clip can safely drop its leading keyframe and pick up mid-GOP.
+    /// Enables cross-track mosh: a V1 clip over V2 can mosh against V2 even
+    /// without a V1 predecessor.
+    pub fn has_mosh_predecessor(&self, idx: usize) -> bool {
+        let start = self.clips[idx].start_frame;
+        if start <= 0 {
+            return false;
+        }
+        let target = start - 1;
+        self.clips.iter().enumerate().any(|(j, c)| {
+            j != idx && c.start_frame <= target && target < c.end_frame()
+        })
+    }
+
+    /// Disable cross-clip mosh on any clip that no longer has a valid
+    /// predecessor frame on either track, and restore its frame count.
     pub fn validate_mosh_state(&mut self) {
         for i in 0..self.clips.len() {
             if !self.clips[i].drop_leading_keyframe {
                 continue;
             }
-            let start = self.clips[i].start_frame;
-            let has_predecessor = self.clips.iter().any(|c| c.end_frame() == start);
-            if !has_predecessor {
+            if !self.has_mosh_predecessor(i) {
                 self.clips[i].drop_leading_keyframe = false;
                 self.clips[i].frame_count += 1;
             }

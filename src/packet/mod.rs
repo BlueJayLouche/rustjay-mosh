@@ -12,6 +12,7 @@ use ffmpeg_next as ffmpeg;
 
 /// A transcoded clip stored as raw H.264 packets.
 /// All clips are normalized to the same resolution during import.
+#[derive(Clone)]
 pub struct PacketClip {
     pub id: u64,
     pub name: String,

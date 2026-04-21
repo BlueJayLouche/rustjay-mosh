@@ -81,6 +81,77 @@ impl PacketDecoder {
         last_yuv.map(Arc::new).ok_or(DecodeError::NoFrame)
     }
 
+    /// Decode `count` frames starting at `start`, seeking to the nearest
+    /// preceding keyframe and discarding any pre-roll frames so only the
+    /// requested range is returned.
+    ///
+    /// Assumes no B-frames (each packet produces one frame in presentation
+    /// order) — which holds for clips produced by this project's importer.
+    pub fn decode_range(
+        &mut self,
+        packets: &[&OwnedPacket],
+        start: usize,
+        count: usize,
+    ) -> Result<Vec<Arc<Yuv420>>, DecodeError> {
+        if packets.is_empty() || count == 0 {
+            return Ok(vec![]);
+        }
+        let end = (start + count).min(packets.len());
+        if start >= end {
+            return Ok(vec![]);
+        }
+
+        let keyframe_start = packets[..=start]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, p)| p.is_key)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        self.decoder.flush();
+
+        let mut frame = ffmpeg::util::frame::video::Video::empty();
+        let want = end - start;
+        let mut frames: Vec<Arc<Yuv420>> = Vec::with_capacity(want);
+        let mut next_out_idx = keyframe_start;
+
+        for pkt in &packets[keyframe_start..end] {
+            let mut packet = ffmpeg::codec::packet::Packet::copy(&pkt.data);
+            packet.set_pts(Some(pkt.pts));
+            packet.set_dts(Some(pkt.dts));
+            packet.set_duration(pkt.duration);
+            if pkt.is_key {
+                packet.set_flags(ffmpeg::codec::packet::Flags::KEY);
+            }
+            self.decoder.send_packet(&packet)?;
+            while self.decoder.receive_frame(&mut frame).is_ok() {
+                if next_out_idx >= start && frames.len() < want {
+                    frames.push(Arc::new(copy_yuv_from_frame(&frame)));
+                }
+                next_out_idx += 1;
+            }
+            if frames.len() >= want {
+                break;
+            }
+        }
+
+        if frames.len() < want {
+            self.decoder.send_eof()?;
+            while self.decoder.receive_frame(&mut frame).is_ok() {
+                if next_out_idx >= start && frames.len() < want {
+                    frames.push(Arc::new(copy_yuv_from_frame(&frame)));
+                }
+                next_out_idx += 1;
+                if frames.len() >= want {
+                    break;
+                }
+            }
+        }
+
+        Ok(frames)
+    }
+
     /// Decode all packets sequentially and return every frame.
     /// More efficient than calling `decode_up_to` repeatedly because
     /// the decoder is only flushed once at the start.

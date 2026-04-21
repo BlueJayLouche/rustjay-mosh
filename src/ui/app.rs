@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 
 use eframe::egui::{self, CursorIcon};
@@ -8,7 +9,7 @@ use crate::audio::{import_audio, AudioClip, AudioTimelineClip};
 use crate::bake::{BendMode, CompressRegion, Effect, bake_segment};
 use crate::codec::ir::Yuv420;
 use crate::importer::import_video;
-use crate::packet::{build_sequence, ClipSpan, PacketClip};
+use crate::packet::{OwnedPacket, PacketClip};
 use crate::preview::decoder::PacketDecoder;
 use crate::render::muxer::export_packets;
 use crate::ui::preview::{YuvPreviewCallback, YuvResources};
@@ -22,6 +23,21 @@ enum ImportResult {
 }
 
 type RenderResult = Result<String, String>;
+
+struct BakeDone {
+    clip: PacketClip,
+    source_name: String,
+    /// Id of the source `TimelineClip` the user baked from.
+    source_tl_clip_id: u64,
+    /// First source packet included in the bake (source-packet coordinates).
+    /// Used to align the baked clip over the source region on V1.
+    source_start: usize,
+}
+
+enum BakeMsg {
+    Progress(f32),
+    Done(Result<BakeDone, String>),
+}
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
@@ -68,6 +84,14 @@ pub struct MoshApp {
     compress_h: u32,
     compress_quality: u8,
     compress_duration: usize,
+    compress_dialog_clip_id: Option<u64>,
+
+    // ── Bake job state ────────────────────────────────────────────────────
+    bake_rx: mpsc::Receiver<BakeMsg>,
+    bake_tx: mpsc::SyncSender<BakeMsg>,
+    bake_in_progress: bool,
+    bake_progress: f32,
+    bake_cancel: Arc<AtomicBool>,
 }
 
 impl MoshApp {
@@ -82,6 +106,7 @@ impl MoshApp {
         let (import_tx, import_rx) = mpsc::sync_channel(4);
         let (render_tx, render_rx) = mpsc::sync_channel(1);
         let (render_result_tx, render_result_rx) = mpsc::sync_channel(1);
+        let (bake_tx, bake_rx) = mpsc::sync_channel(64);
         Self {
             packet_clips: vec![],
             audio_clips: vec![],
@@ -119,6 +144,13 @@ impl MoshApp {
             compress_h: 720,
             compress_quality: 15,
             compress_duration: 0,
+            compress_dialog_clip_id: None,
+
+            bake_rx,
+            bake_tx,
+            bake_in_progress: false,
+            bake_progress: 0.0,
+            bake_cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -187,7 +219,14 @@ impl MoshApp {
                     }
                 }
 
-                let start_frame = self.timeline.clips.iter().map(|c| c.end_frame()).max().unwrap_or(0);
+                let start_frame = self
+                    .timeline
+                    .clips
+                    .iter()
+                    .filter(|c| c.track == 1)
+                    .map(|c| c.end_frame())
+                    .max()
+                    .unwrap_or(0);
                 self.timeline.clips.push(TimelineClip {
                     id: self.clip_uid,
                     clip_idx,
@@ -199,6 +238,7 @@ impl MoshApp {
                     color: next_clip_color(self.color_idx),
                     selected: false,
                     drop_leading_keyframe: false,
+                    track: 1,
                 });
                 self.clip_uid += 1;
                 self.color_idx += 1;
@@ -229,16 +269,8 @@ impl MoshApp {
     // ── Mosh operations ───────────────────────────────────────────────────────
 
     fn cross_clip_mosh(&mut self, b_idx: usize) {
-        let clips = &self.timeline.clips;
-        let clip_b_start = clips[b_idx].start_frame;
-
-        let has_prev = clips
-            .iter()
-            .enumerate()
-            .any(|(i, c)| i != b_idx && c.end_frame() <= clip_b_start);
-
-        if !has_prev {
-            self.status = "No preceding clip to mosh with.".into();
+        if !self.timeline.has_mosh_predecessor(b_idx) {
+            self.status = "No clip covers the preceding frame — nothing to mosh against.".into();
             return;
         }
 
@@ -267,11 +299,13 @@ impl MoshApp {
 
     // ── Glitch dialogs ────────────────────────────────────────────────────────
 
-    fn show_bend_dialog(&mut self, ctx: &egui::Context) {
+    fn draw_bend_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_bend_dialog {
             return;
         }
+        let ctx_clone = ctx.clone();
         let mut open = self.show_bend_dialog;
+        let busy = self.bake_in_progress;
         egui::Window::new("🌀 Data Bend")
             .collapsible(false)
             .resizable(false)
@@ -343,8 +377,9 @@ impl MoshApp {
 
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Apply").clicked() {
-                        self.apply_bake(Effect::Bend(self.bend_mode_from_state()));
+                    let apply = ui.add_enabled(!busy, egui::Button::new("Apply"));
+                    if apply.clicked() {
+                        self.apply_bake(Effect::Bend(self.bend_mode_from_state()), &ctx_clone);
                         self.show_bend_dialog = false;
                     }
                     if ui.button("Cancel").clicked() {
@@ -362,16 +397,48 @@ impl MoshApp {
             2 => BendMode::Bitcrush { bits: self.bend_bitcrush_bits },
             3 => BendMode::ByteSwap { stride: self.bend_byteswap_stride },
             4 => BendMode::Xor { mask: self.bend_xor_mask },
-            5 => BendMode::Noise { amount: self.bend_noise_amount },
+            5 => BendMode::Noise {
+                amount: self.bend_noise_amount,
+                seed: rand::random::<u64>(),
+            },
             _ => BendMode::ReverseScanlines,
         }
     }
 
-    fn show_compress_dialog(&mut self, ctx: &egui::Context) {
+    /// Resolve the selected clip's native dimensions for compress-dialog bounds.
+    fn selected_clip_dims(&self) -> (u32, u32) {
+        self.timeline
+            .selected_video_idx()
+            .and_then(|i| self.packet_clips.get(self.timeline.clips[i].clip_idx))
+            .map(|c| (c.width.max(1), c.height.max(1)))
+            .unwrap_or((1920, 1080))
+    }
+
+    fn draw_compress_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_compress_dialog {
             return;
         }
+        let ctx_clone = ctx.clone();
         let mut open = self.show_compress_dialog;
+        let busy = self.bake_in_progress;
+        let (fw, fh) = self.selected_clip_dims();
+        let current_clip_id = self
+            .timeline
+            .selected_video_idx()
+            .map(|i| self.timeline.clips[i].id);
+        if self.compress_dialog_clip_id != current_clip_id {
+            self.compress_dialog_clip_id = current_clip_id;
+            self.compress_x = 0;
+            self.compress_y = 0;
+            self.compress_w = fw;
+            self.compress_h = fh;
+        }
+        // Keep prior values inside the new clip's bounds.
+        self.compress_x = self.compress_x.min(fw.saturating_sub(1));
+        self.compress_y = self.compress_y.min(fh.saturating_sub(1));
+        self.compress_w = self.compress_w.clamp(1, fw - self.compress_x);
+        self.compress_h = self.compress_h.clamp(1, fh - self.compress_y);
+
         egui::Window::new("🗜 Compress Region")
             .collapsible(false)
             .resizable(false)
@@ -386,19 +453,20 @@ impl MoshApp {
                 });
                 ui.add_space(8.0);
 
-                ui.label("Region (x, y, w, h):");
+                ui.label(format!("Region (x, y, w, h) — frame is {fw}×{fh}:"));
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut self.compress_x).range(0..=1280));
-                    ui.add(egui::DragValue::new(&mut self.compress_y).range(0..=720));
-                    ui.add(egui::DragValue::new(&mut self.compress_w).range(1..=1280));
-                    ui.add(egui::DragValue::new(&mut self.compress_h).range(1..=720));
+                    ui.add(egui::DragValue::new(&mut self.compress_x).range(0..=fw.saturating_sub(1)));
+                    ui.add(egui::DragValue::new(&mut self.compress_y).range(0..=fh.saturating_sub(1)));
+                    ui.add(egui::DragValue::new(&mut self.compress_w).range(1..=fw - self.compress_x));
+                    ui.add(egui::DragValue::new(&mut self.compress_h).range(1..=fh - self.compress_y));
                 });
                 ui.label("Quality (lower = more artifacts):");
                 ui.add(egui::Slider::new(&mut self.compress_quality, 1..=100));
 
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Apply").clicked() {
+                    let apply = ui.add_enabled(!busy, egui::Button::new("Apply"));
+                    if apply.clicked() {
                         let region = CompressRegion {
                             x: self.compress_x,
                             y: self.compress_y,
@@ -406,7 +474,7 @@ impl MoshApp {
                             h: self.compress_h,
                             quality: self.compress_quality,
                         };
-                        self.apply_bake(Effect::Compress(region));
+                        self.apply_bake(Effect::Compress(region), &ctx_clone);
                         self.show_compress_dialog = false;
                     }
                     if ui.button("Cancel").clicked() {
@@ -417,7 +485,35 @@ impl MoshApp {
         self.show_compress_dialog = open;
     }
 
-    fn apply_bake(&mut self, effect: Effect) {
+    /// Map the dialog "Duration" radio index to a `(start, count)` pair in
+    /// source-packet coordinates, clamped to the clip's packet range.
+    fn duration_to_range(
+        duration_idx: usize,
+        playhead_local: usize,
+        total_source: usize,
+        clip_offset: usize,
+        clip_count: usize,
+    ) -> (usize, usize) {
+        let clamped_ph = playhead_local.min(total_source.saturating_sub(1));
+        match duration_idx {
+            0 => (clamped_ph, 1),
+            1 => {
+                let s = clamped_ph.saturating_sub(5);
+                (s, 11.min(total_source - s))
+            }
+            2 => {
+                let s = clamped_ph.saturating_sub(15);
+                (s, 31.min(total_source - s))
+            }
+            _ => (clip_offset, clip_count),
+        }
+    }
+
+    fn apply_bake(&mut self, effect: Effect, ctx: &egui::Context) {
+        if self.bake_in_progress {
+            self.status = "A bake is already running.".into();
+            return;
+        }
         let Some(sel_idx) = self.timeline.selected_video_idx() else {
             self.status = "No clip selected.".into();
             return;
@@ -436,31 +532,158 @@ impl MoshApp {
         let playhead_local = (self.timeline.playhead - tl_clip.start_frame)
             .max(0) as usize
             + tl_clip.source_offset;
-        let playhead_local = playhead_local.min(total_source.saturating_sub(1));
 
         let duration = match &effect {
             Effect::Bend(_) => self.bend_duration,
             Effect::Compress(_) => self.compress_duration,
         };
 
-        let (start, count) = match duration {
-            0 => (playhead_local, 1),
-            1 => (playhead_local.saturating_sub(5), 11.min(total_source - playhead_local.saturating_sub(5))),
-            2 => (playhead_local.saturating_sub(15), 31.min(total_source - playhead_local.saturating_sub(15))),
-            _ => (tl_clip.source_offset, tl_clip.frame_count),
+        // A timeline-ruler selection overrides the Duration radio. Map it from
+        // timeline frames into source-packet coordinates against the selected
+        // clip; if it doesn't overlap the clip, bail out rather than silently
+        // falling back.
+        let drop_skip = if tl_clip.drop_leading_keyframe { 1 } else { 0 };
+        let visible_first = tl_clip.source_offset + drop_skip;
+        let visible_end = visible_first + tl_clip.frame_count;
+
+        let (start, count) = if let Some((sel_a, sel_b)) = self.timeline.selection {
+            let (sel_lo, sel_hi) = if sel_b >= sel_a { (sel_a, sel_b) } else { (sel_b, sel_a) };
+            let tl_start = tl_clip.start_frame;
+            let tl_end = tl_start + tl_clip.frame_count as i64;
+            let lo = sel_lo.max(tl_start);
+            let hi = sel_hi.min(tl_end);
+            if hi <= lo {
+                self.status = "Selection doesn't overlap the selected clip.".into();
+                return;
+            }
+            let local_start = (lo - tl_start) as usize;
+            let local_end = (hi - tl_start) as usize;
+            (
+                visible_first + local_start,
+                local_end.saturating_sub(local_start),
+            )
+        } else {
+            Self::duration_to_range(
+                duration,
+                playhead_local,
+                total_source,
+                tl_clip.source_offset,
+                tl_clip.frame_count,
+            )
         };
 
-        match bake_segment(source_clip, start, count, effect, self.render_fps) {
-            Ok(clip) => {
-                let name = format!("{}_baked_{:02}", tl_clip.name, self.clip_uid);
-                self.clip_uid += 1;
-                self.packet_clips.push(PacketClip { name: name.clone(), ..clip });
-                self.status = format!("'{}' ready — {count} frames baked.", name);
-            }
-            Err(e) => {
-                self.status = format!("Bake failed: {e}");
-            }
+        // Clamp the bake range to the visible portion of this TimelineClip.
+        // Source packets played by the clip start at source_offset + drop_skip
+        // (the leading-keyframe skip introduced by cross-clip mosh) and run for
+        // frame_count packets. Baking outside that window would desync pre/post.
+        let start_clamped = start.max(visible_first).min(visible_end);
+        let count_clamped = count.min(visible_end.saturating_sub(start_clamped));
+
+        if count_clamped == 0 {
+            self.status = "Nothing to bake in the selected range.".into();
+            return;
         }
+
+        let source_name = tl_clip.name.clone();
+        let source_tl_clip_id = tl_clip.id;
+        let source_clip = source_clip.clone();
+        let fps = self.render_fps;
+        let tx = self.bake_tx.clone();
+        self.bake_cancel = Arc::new(AtomicBool::new(false));
+        let cancel = self.bake_cancel.clone();
+        let ctx_for_thread = ctx.clone();
+        let source_name_thread = source_name.clone();
+
+        self.bake_in_progress = true;
+        self.bake_progress = 0.0;
+        self.status = format!("Baking {count_clamped} frame(s)…");
+
+        std::thread::spawn(move || {
+            let mut report = |p: f32| {
+                let _ = tx.send(BakeMsg::Progress(p));
+                ctx_for_thread.request_repaint();
+            };
+            let result = bake_segment(
+                &source_clip,
+                start_clamped,
+                count_clamped,
+                effect,
+                fps,
+                &mut report,
+                &cancel,
+            );
+            let msg = match result {
+                Ok(clip) => Ok(BakeDone {
+                    clip,
+                    source_name: source_name_thread,
+                    source_tl_clip_id,
+                    source_start: start_clamped,
+                }),
+                Err(e) => Err(format!("{e}")),
+            };
+            let _ = tx.send(BakeMsg::Done(msg));
+            ctx_for_thread.request_repaint();
+        });
+    }
+
+    fn cancel_bake(&mut self) {
+        if self.bake_in_progress {
+            self.bake_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.status = "Cancelling bake…".into();
+        }
+    }
+
+    fn finish_bake(&mut self, done: BakeDone) {
+        let name = format!("{}_baked_{:02}", done.source_name, self.clip_uid);
+        let baked_clip_idx = self.packet_clips.len();
+        let baked_frame_count = done.clip.packets.len();
+        self.packet_clips
+            .push(PacketClip { name: name.clone(), ..done.clip });
+
+        // Place the baked clip on V1 (top track) at the timeline frame where
+        // the source region it was baked from begins. At playback the baked
+        // clip overlays its V2 source; when it ends and V2 resumes mid-GOP
+        // the decoder bleeds the baked clip's final state into V2's P-frames.
+        let src_pos = self
+            .timeline
+            .clips
+            .iter()
+            .position(|c| c.id == done.source_tl_clip_id);
+
+        let start_frame = match src_pos {
+            Some(pos) => {
+                let src = &self.timeline.clips[pos];
+                let drop_skip = if src.drop_leading_keyframe { 1 } else { 0 };
+                let visible_first = src.source_offset + drop_skip;
+                let bake_first = done.source_start.max(visible_first);
+                src.start_frame + (bake_first.saturating_sub(visible_first)) as i64
+            }
+            None => self.timeline.playhead.max(0),
+        };
+
+        let new_id = self.timeline.next_id();
+        self.timeline.clips.push(TimelineClip {
+            id: new_id,
+            clip_idx: baked_clip_idx,
+            name: name.clone(),
+            frame_count: baked_frame_count,
+            source_frame_count: baked_frame_count,
+            start_frame,
+            source_offset: 0,
+            color: next_clip_color(self.color_idx),
+            selected: false,
+            drop_leading_keyframe: false,
+            track: 0,
+        });
+        self.clip_uid += 1;
+        self.color_idx += 1;
+        self.timeline.clips.sort_by_key(|c| c.start_frame);
+        self.timeline.validate_mosh_state();
+        self.preview_cache = None;
+        self.status = format!(
+            "'{}' baked to V1 at frame {} ({} frames).",
+            name, start_frame, baked_frame_count
+        );
     }
 
     // ── Render ────────────────────────────────────────────────────────────────
@@ -481,39 +704,41 @@ impl MoshApp {
     }
 
     fn start_render(&mut self, output_path: PathBuf, ctx: &egui::Context) {
-        let sorted = self.timeline.sorted_clips();
-        if sorted.is_empty() {
+        if self.timeline.clips.is_empty() {
             self.status = "Nothing on the timeline to render.".into();
             return;
         }
 
-        // Build video packet list
-        let mut render_packets: Vec<crate::packet::OwnedPacket> = Vec::new();
-        let mut pts_offset = 0i64;
-        for (i, clip) in sorted.iter().enumerate() {
-            let prev_ends = if i == 0 { None } else { Some(sorted[i - 1].end_frame()) };
-            let can_drop = prev_ends.map_or(false, |end| end == clip.start_frame);
-            let drop = can_drop && clip.drop_leading_keyframe;
-            let packet_clip = &self.packet_clips[clip.clip_idx];
-            let start = clip.source_offset + if drop { 1 } else { 0 };
-            let packets_iter = packet_clip.packets.iter().skip(start).take(clip.frame_count);
-            if let Some(first_pkt) = packets_iter.clone().next() {
-                let first = first_pkt.pts;
-                for pkt in packets_iter {
-                    let mut adjusted = pkt.clone();
-                    adjusted.pts = pkt.pts - first + pts_offset;
-                    adjusted.dts = pkt.dts - first + pts_offset;
-                    render_packets.push(adjusted);
-                }
-                if let Some(last) = packet_clip.packets.iter().skip(start).take(clip.frame_count).last() {
-                    pts_offset += last.pts + last.duration - first;
-                }
-            }
-        }
-
-        if render_packets.is_empty() {
+        // Build the two-track playback sequence, then rewrite PTS/DTS
+        // monotonically so the output stream is well-formed regardless of
+        // which clip each packet came from.
+        let (seq_refs, _) = build_playback_sequence(
+            &self.timeline.clips,
+            &self.packet_clips,
+            self.timeline.total_frame_count() as i64,
+            self.timeline.playhead,
+        );
+        if seq_refs.is_empty() {
             self.status = "Nothing on the timeline to render.".into();
             return;
+        }
+        // Normalise every packet to one frame at render_fps, regardless of
+        // which clip (source vs baked) it came from. Source and baked clips
+        // carry durations stamped against their own per-clip time_bases; muxing
+        // them with a single shared time_base would otherwise rescale the
+        // baked clip's tiny durations into near-instant playback (fast-forward
+        // through baked sections). Unifying duration = 1 at time_base = 1/fps
+        // keeps every packet exactly one frame long at playback time.
+        let mut render_packets: Vec<crate::packet::OwnedPacket> =
+            Vec::with_capacity(seq_refs.len());
+        for (i, pkt) in seq_refs.iter().enumerate() {
+            render_packets.push(crate::packet::OwnedPacket {
+                data: pkt.data.clone(),
+                pts: i as i64,
+                dts: i as i64,
+                duration: 1,
+                is_key: pkt.is_key,
+            });
         }
 
         self.status = format!("Rendering {} video packets…", render_packets.len());
@@ -523,7 +748,7 @@ impl MoshApp {
         let tx = self.render_result_tx.clone();
         let ctx = ctx.clone();
         let codec_params = self.packet_clips[0].codec_parameters.clone();
-        let time_base = self.packet_clips[0].time_base;
+        let time_base = ffmpeg_next::Rational(1, fps as i32);
         let total_frames = self.timeline.total_frame_count();
         let audio_sources = self.audio_clips.clone();
         let audio_timeline: Vec<AudioTimelineClip> = self.timeline.audio_clips.clone();
@@ -615,42 +840,27 @@ impl MoshApp {
     // ── Preview ───────────────────────────────────────────────────────────────
 
     fn current_preview_yuv(&mut self) -> Option<Arc<Yuv420>> {
-        let (clip_idx, local_frame) = self.timeline.clip_at_playhead()?;
-        let global_frame = self.timeline.clips[..clip_idx]
-            .iter()
-            .filter(|c| c.start_frame < self.timeline.playhead)
-            .map(|c| c.frame_count)
-            .sum::<usize>()
-            + local_frame;
+        let (sequence, ph_idx) = build_playback_sequence(
+            &self.timeline.clips,
+            &self.packet_clips,
+            self.timeline.total_frame_count() as i64,
+            self.timeline.playhead,
+        );
+        if sequence.is_empty() {
+            return None;
+        }
+        let target = ph_idx.unwrap_or(sequence.len().saturating_sub(1));
 
         if let Some((cached_frame, cached_yuv)) = &self.preview_cache {
-            if *cached_frame == global_frame {
+            if *cached_frame == target {
                 return Some(cached_yuv.clone());
             }
         }
 
-        let sorted = self.timeline.sorted_clips();
-        let mut spans = Vec::with_capacity(sorted.len());
-        for (i, clip) in sorted.iter().enumerate() {
-            let prev_ends = if i == 0 { None } else { Some(sorted[i - 1].end_frame()) };
-            let can_drop = prev_ends.map_or(false, |end| end == clip.start_frame);
-            let drop_leading_keyframe = can_drop && clip.drop_leading_keyframe;
-            spans.push(ClipSpan {
-                clip: &self.packet_clips[clip.clip_idx],
-                source_offset: clip.source_offset,
-                visible_count: clip.frame_count,
-                drop_leading_keyframe,
-            });
-        }
-        let sequence = build_sequence(&spans);
-        if sequence.is_empty() {
-            return None;
-        }
-
         let decoder = self.packet_decoder.as_mut()?;
-        match decoder.decode_up_to(&sequence, global_frame) {
+        match decoder.decode_up_to(&sequence, target) {
             Ok(yuv) => {
-                self.preview_cache = Some((global_frame, yuv.clone()));
+                self.preview_cache = Some((target, yuv.clone()));
                 Some(yuv)
             }
             Err(e) => {
@@ -662,7 +872,7 @@ impl MoshApp {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    fn add_video_from_pool(&mut self, pool_idx: usize, target_frame: i64) {
+    fn add_video_from_pool(&mut self, pool_idx: usize, target_frame: i64, track: u8) {
         if pool_idx >= self.packet_clips.len() { return; }
         let packet_clip = &self.packet_clips[pool_idx];
         let frame_count = packet_clip.packets.len();
@@ -680,6 +890,7 @@ impl MoshApp {
             color: next_clip_color(self.color_idx),
             selected: false,
             drop_leading_keyframe: false,
+            track: track.min(1),
         });
         self.clip_uid += 1;
         self.color_idx += 1;
@@ -706,6 +917,55 @@ impl MoshApp {
         self.preview_cache = None;
         self.timeline.audio_clips.sort_by_key(|c| c.start_frame);
     }
+}
+
+// ── Two-track packet resolver ────────────────────────────────────────────────
+
+/// Resolve one timeline frame into the packet that feeds the decoder there,
+/// picking the top track (track 0) first and falling back to the bottom
+/// (track 1). Returns `None` when neither track covers the frame.
+fn resolve_packet_at<'a>(
+    clips: &'a [TimelineClip],
+    packet_clips: &'a [PacketClip],
+    f: i64,
+) -> Option<&'a OwnedPacket> {
+    for track in 0..=1u8 {
+        for clip in clips {
+            if clip.track != track {
+                continue;
+            }
+            if f < clip.start_frame || f >= clip.end_frame() {
+                continue;
+            }
+            let drop_skip = if clip.drop_leading_keyframe { 1 } else { 0 };
+            let src_idx = clip.source_offset + drop_skip + (f - clip.start_frame) as usize;
+            let packet_clip = packet_clips.get(clip.clip_idx)?;
+            return packet_clip.packets.get(src_idx);
+        }
+    }
+    None
+}
+
+/// Walk the timeline frame-by-frame and collect the packet sequence the
+/// decoder should replay. The second component is the playhead's index inside
+/// the returned sequence, or `None` if no clip covers the playhead frame.
+fn build_playback_sequence<'a>(
+    clips: &'a [TimelineClip],
+    packet_clips: &'a [PacketClip],
+    total_frames: i64,
+    playhead: i64,
+) -> (Vec<&'a OwnedPacket>, Option<usize>) {
+    let mut seq: Vec<&'a OwnedPacket> = Vec::with_capacity(total_frames.max(0) as usize);
+    let mut ph_idx: Option<usize> = None;
+    for f in 0..total_frames {
+        if let Some(p) = resolve_packet_at(clips, packet_clips, f) {
+            if f == playhead {
+                ph_idx = Some(seq.len());
+            }
+            seq.push(p);
+        }
+    }
+    (seq, ph_idx)
 }
 
 // ── eframe::App ───────────────────────────────────────────────────────────────
@@ -748,6 +1008,36 @@ impl eframe::App for MoshApp {
 
         if self.is_rendering {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+
+        // Drain bake messages (progress + completion).
+        loop {
+            match self.bake_rx.try_recv() {
+                Ok(BakeMsg::Progress(p)) => {
+                    self.bake_progress = p;
+                }
+                Ok(BakeMsg::Done(Ok(done))) => {
+                    self.bake_in_progress = false;
+                    self.bake_progress = 1.0;
+                    self.finish_bake(done);
+                }
+                Ok(BakeMsg::Done(Err(e))) => {
+                    self.bake_in_progress = false;
+                    self.bake_progress = 0.0;
+                    self.status = format!("Bake failed: {e}");
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if self.bake_in_progress {
+                        self.bake_in_progress = false;
+                        self.status = "Bake thread crashed — check terminal for details.".into();
+                    }
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+            }
+        }
+        if self.bake_in_progress {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         // ── Keyboard shortcuts ────────────────────────────────────────────────
@@ -829,14 +1119,7 @@ impl eframe::App for MoshApp {
                 ui.label(format!("Selected: {name}"));
                 ui.add_space(6.0);
 
-                let has_prev = {
-                    let start = self.timeline.clips[idx].start_frame;
-                    self.timeline
-                        .clips
-                        .iter()
-                        .enumerate()
-                        .any(|(i, c)| i != idx && c.end_frame() <= start)
-                };
+                let has_prev = self.timeline.has_mosh_predecessor(idx);
 
                 let already_moshed = self.timeline.clips[idx].drop_leading_keyframe;
 
@@ -867,11 +1150,29 @@ impl eframe::App for MoshApp {
                 ui.separator();
                 ui.heading("Glitch");
                 ui.add_space(4.0);
-                if ui.button("🌀 Bend at playhead").clicked() {
+                let busy = self.bake_in_progress;
+                if ui
+                    .add_enabled(!busy, egui::Button::new("🌀 Bend at playhead"))
+                    .clicked()
+                {
                     self.show_bend_dialog = true;
                 }
-                if ui.button("🗜 Compress region").clicked() {
+                if ui
+                    .add_enabled(!busy, egui::Button::new("🗜 Compress region"))
+                    .clicked()
+                {
                     self.show_compress_dialog = true;
+                }
+                if busy {
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::ProgressBar::new(self.bake_progress)
+                            .show_percentage()
+                            .animate(true),
+                    );
+                    if ui.button("✖ Cancel bake").clicked() {
+                        self.cancel_bake();
+                    }
                 }
             } else {
                 ui.label("(no clip selected)");
@@ -884,6 +1185,17 @@ impl eframe::App for MoshApp {
                 ui.add_space(4.0);
                 ui.add_enabled(false, egui::Button::new("🌀 Bend at playhead"));
                 ui.add_enabled(false, egui::Button::new("🗜 Compress region"));
+                if self.bake_in_progress {
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::ProgressBar::new(self.bake_progress)
+                            .show_percentage()
+                            .animate(true),
+                    );
+                    if ui.button("✖ Cancel bake").clicked() {
+                        self.cancel_bake();
+                    }
+                }
             }
 
             ui.add_space(16.0);
@@ -916,12 +1228,24 @@ impl eframe::App for MoshApp {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label("Zoom:");
+                if ui.small_button("−").clicked() {
+                    self.timeline.zoom = (self.timeline.zoom * 0.75).clamp(0.02, 500.0);
+                }
+                if ui.small_button("+").clicked() {
+                    self.timeline.zoom = (self.timeline.zoom * 1.3333).clamp(0.02, 500.0);
+                }
                 ui.add(
-                    egui::Slider::new(&mut self.timeline.zoom, 0.5..=40.0)
+                    egui::Slider::new(&mut self.timeline.zoom, 0.02..=40.0)
+                        .logarithmic(true)
                         .show_value(false),
                 );
             });
-            ui.label("Ctrl+scroll to zoom\nScroll to pan");
+            if self.timeline.selection.is_some()
+                && ui.small_button("Clear selection").clicked()
+            {
+                self.timeline.clear_selection();
+            }
+            ui.label("Ctrl+scroll to zoom\nScroll to pan\nDrag on ruler to select");
         });
 
         // ── Timeline (bottom) ─────────────────────────────────────────────────
@@ -935,7 +1259,10 @@ impl eframe::App for MoshApp {
 
                 if let (Some(payload), Some(drop_frame)) = (tl_resp.dropped_payload, tl_resp.drop_frame) {
                     match payload {
-                        PoolDragPayload::Video(pool_idx) => self.add_video_from_pool(pool_idx, drop_frame),
+                        PoolDragPayload::Video(pool_idx) => {
+                            let track = if tl_resp.drop_is_audio { 0 } else { tl_resp.drop_track };
+                            self.add_video_from_pool(pool_idx, drop_frame, track);
+                        }
                         PoolDragPayload::Audio(pool_idx) => self.add_audio_from_pool(pool_idx, drop_frame),
                     }
                 }
@@ -957,7 +1284,7 @@ impl eframe::App for MoshApp {
         });
 
         // ── Glitch dialogs ────────────────────────────────────────────────────
-        self.show_bend_dialog(ctx);
-        self.show_compress_dialog(ctx);
+        self.draw_bend_dialog(ctx);
+        self.draw_compress_dialog(ctx);
     }
 }
