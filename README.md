@@ -27,15 +27,21 @@ The result is the iconic "melting" or "smearing" glitch aesthetic found in music
 ## Features
 
 - **FFmpeg importer** — open any format ffmpeg supports (mp4, mov, mkv, avi, webm, …). Each clip is transparently transcoded to a long-GOP H.264 intermediate with one I-frame and all P-frames.
+- **Auto audio extraction** — importing a video file automatically extracts its embedded audio track and places it on the audio lane, frame-aligned with the video clip.
 - **Packet-based datamoshing** — no custom software codec. We manipulate the raw H.264 packet stream directly, so output looks identical to professional tools like Supermosh.
 - **Fast import** — clips appear on the timeline instantly; no background P-frame encoding step.
-- **Clip pool** — imported clips live in a left sidebar; drag any pool item onto the timeline
-- **Interactive timeline** — drag clips, scrub the playhead, zoom with Ctrl+scroll
-- **Trim handles** — drag the left/right edges of a placed clip to set in/out points
-- **Snap-to-edge** — dragging a clip body snaps its start or end to the nearest clip edge
+- **Clip pool** — imported clips live in a left sidebar; drag any pool item onto the timeline (video or audio).
+- **Interactive timeline** — drag clips, scrub the playhead, zoom with Ctrl+scroll, timecode ruler (`hh:mm:ss:ff`)
+- **Trim handles** — drag the left/right edges of a placed clip to set in/out points; audio trim handles snap to video clip edges
+- **Snap-to-edge** — dragging or trimming a clip snaps its moving edge to the nearest clip edge
+- **Top-clip selection** — clicking where clips overlap always selects the topmost (visually frontmost) clip
+- **Non-blocking preview** — playhead scrubbing and ruler selection update instantly; preview frames decode in a background thread so the UI never stalls
 - **Cross-clip mosh** — one click drops the leading keyframe of the selected clip so it bleeds into the preceding clip
+- **Glitch effects (Bake)** — decode → manipulate pixels → re-encode. Includes data bending (reverse scanlines, echo, bitcrush, byte swap, XOR, noise) and JPEG compression artifacting on arbitrary regions.
+- **Audio tracks** — import audio (or extract from video), place on timeline, trim, fade in/out, crossfade. Renders to AAC 192 kbps.
+- **Multi-track video** — stack clips on two video tracks (0 = top, 1 = bottom)
 - **wgpu preview** — GPU-accelerated YUV→RGB display via a WGSL BT.601 shader; no CPU colour conversion
-- **Render to MP4** — remuxes the manipulated packet stream directly to H.264 MP4 without re-encoding
+- **Render to MP4** — remuxes the manipulated packet stream directly to H.264 MP4 without re-encoding, with mixed audio
 
 ---
 
@@ -80,7 +86,8 @@ cargo run --release
 ### Basic workflow
 
 1. **Import clips** — click **➕ Import clip** (repeat for each clip).  
-   Each clip is transcoded to a one-keyframe H.264 stream and appears in the **Clip Pool** on the left.
+   Each clip is transcoded to a one-keyframe H.264 stream and appears in the **Clip Pool** on the left.  
+   If the file contains an audio track it is automatically extracted and placed on the audio lane, aligned with the video clip.
 
 2. **Build the timeline** — drag clips from the pool onto the timeline track, or rearrange existing clips by dragging their bodies. Clips snap end-to-end automatically when dragged close to another edge.
 
@@ -90,17 +97,29 @@ cargo run --release
    Clip B's leading I-frame is dropped and the clip shrinks by one frame; its P-frames now decode against clip A's pixels.  
    Clip A's pixels morph through clip B's motion.
 
-5. **Render** — set the output FPS, click **🎬 Render to file…**, choose an output path.  
-   The packet sequence is rewritten with monotonic timestamps and remuxed to MP4.
+5. **Glitch effects (Bake)** — select a clip, open **🌀 Data Bend** or **🗜 Compress Region**, adjust parameters, and click **Bake**.  
+   The segment is decoded, the effect is applied per-frame, and the result is re-encoded to a new H.264 clip that replaces the selection.  
+   Effects include reverse scanlines, echo, bitcrush, byte swap, XOR, noise, and low-quality JPEG re-compression regions.
+
+6. **Audio** — audio is extracted automatically on video import, or drag a standalone audio file into the audio lane.  
+   Trim the edges of an audio clip to snap them to video clip boundaries.  
+   Hold **Shift** and drag the **left half** of an audio clip rightward to adjust fade in; hold **Shift** and drag the **right half** leftward to adjust fade out. Crossfades are automatic when adjacent clips have overlapping fade regions.
+
+7. **Render** — set the output FPS, click **🎬 Render to file…**, choose an output path.  
+   The packet sequence is rewritten with monotonic timestamps and remuxed to MP4. If audio clips exist, a 48 kHz stereo mix is rendered and muxed to AAC.
 
 ### Timeline controls
 
 | Action | Gesture |
 |---|---|
-| Select clip | Click body |
+| Select clip | Click body (topmost clip wins when stacked) |
 | Move clip | Drag body |
-| Trim in/out | Drag left/right edge |
+| Trim in | Drag left edge (snaps to clip edges) |
+| Trim out | Drag right edge (snaps to clip edges) |
+| Fade in (audio) | Shift + drag right on left half |
+| Fade out (audio) | Shift + drag left on right half |
 | Move playhead | Click ruler or empty track |
+| Select range | Drag on ruler |
 | Pan timeline | Scroll |
 | Zoom timeline | Ctrl + scroll |
 
@@ -139,10 +158,12 @@ cargo run --release
 | `preview::decoder` | `PacketDecoder` — flush + sequential decode up to any frame |
 | `render::muxer` | `export_packets` — remux packet slice to MP4 without re-encoding |
 | `importer` | FFmpeg transcode + packet extraction |
+| `audio` | `AudioClip`, `AudioTimelineClip`, `import_audio`, `render_audio_mix` |
+| `bake` | `bake_segment` — decode, apply effects (bend/compress), re-encode to H.264 |
 | `frame_graph` | DAG of frame references (legacy data structure) |
 | `datamosh` | Graph-level operations (legacy, kept for reference) |
 | `ui::app` | `MoshApp` — eframe application, wires everything together |
-| `ui::timeline_panel` | `TimelinePanel` egui widget — clips, drag, trim handles, snap, playhead |
+| `ui::timeline_panel` | `TimelinePanel` egui widget — clips, drag, trim handles, snap, playhead, audio lane |
 | `ui::preview` | `YuvResources` + `YuvPreviewCallback` — wgpu YUV→RGB render pipeline |
 | `ui::shader.wgsl` | BT.601 YCbCr→RGB WGSL fragment shader |
 
@@ -150,12 +171,15 @@ cargo run --release
 
 ## Roadmap
 
-- [ ] Timecode ruler (`hh:mm:ss:ff`) on timeline
-- [ ] Audio track support with fades and visible waveforms
-- [ ] Audio passthrough in render
+- [x] Timecode ruler (`hh:mm:ss:ff`) on timeline
+- [x] Audio track support with fades and visible waveforms
+- [x] Audio passthrough in render
+- [x] Selective frame dropping / duplicating for advanced glitch effects (bake pipeline)
+- [x] Auto audio extraction on video import
+- [x] Non-blocking preview — scrubbing and selection never block the UI
+- [x] Audio trim snapping to video clip edges
 - [ ] Motion vector visualisation overlay
 - [ ] Thumbnail strip on timeline clips
-- [ ] Selective frame dropping / duplicating for advanced glitch effects
 - [ ] Export to formats other than H.264
 
 ---

@@ -18,7 +18,7 @@ use crate::ui::timeline_panel::{next_clip_color, PoolDragPayload, TimelineClip, 
 // ── Background messages ────────────────────────────────────────────────────────
 
 enum ImportResult {
-    Video { name: String, packet_clip: PacketClip },
+    Video { name: String, packet_clip: PacketClip, audio_clip: Option<AudioClip> },
     Audio { name: String, audio_clip: AudioClip },
 }
 
@@ -44,8 +44,16 @@ enum BakeMsg {
 pub struct MoshApp {
     packet_clips: Vec<PacketClip>,
     audio_clips: Vec<AudioClip>,
-    packet_decoder: Option<PacketDecoder>,
     preview_cache: Option<(usize, Arc<Yuv420>)>,
+    /// Request channel to the background preview decode thread.
+    /// Payload: (packets to decode, target index within that slice, absolute timeline frame).
+    preview_req_tx: Option<mpsc::SyncSender<(Vec<OwnedPacket>, usize, usize)>>,
+    /// Results from the background decode thread: (absolute timeline frame, decoded image).
+    preview_res_rx: mpsc::Receiver<(usize, Arc<Yuv420>)>,
+    /// Sender half stored so we can clone it into the worker when it spawns.
+    preview_res_tx: mpsc::Sender<(usize, Arc<Yuv420>)>,
+    /// Set when a try_send failed (worker busy); schedule a retry repaint.
+    preview_dirty: bool,
 
     timeline: TimelinePanel,
     color_idx: usize,
@@ -107,11 +115,15 @@ impl MoshApp {
         let (render_tx, render_rx) = mpsc::sync_channel(1);
         let (render_result_tx, render_result_rx) = mpsc::sync_channel(1);
         let (bake_tx, bake_rx) = mpsc::sync_channel(64);
+        let (preview_res_tx, preview_res_rx) = mpsc::channel();
         Self {
             packet_clips: vec![],
             audio_clips: vec![],
-            packet_decoder: None,
             preview_cache: None,
+            preview_req_tx: None,
+            preview_res_rx,
+            preview_res_tx,
+            preview_dirty: false,
             timeline: TimelinePanel::new(),
             color_idx: 0,
             clip_uid: 0,
@@ -194,7 +206,11 @@ impl MoshApp {
                     .map_err(|e| format!("Audio import failed: {e}"))
             } else {
                 import_video(&path, &name)
-                    .map(|(packet_clip, _first_yuv)| ImportResult::Video { name, packet_clip })
+                    .map(|(packet_clip, _first_yuv)| {
+                        // Also extract the embedded audio track, if any.
+                        let audio_clip = import_audio(&path, &name, fps).ok();
+                        ImportResult::Video { name, packet_clip, audio_clip }
+                    })
                     .map_err(|e| format!("Video import failed: {e}"))
             };
             let _ = tx.send(result);
@@ -204,19 +220,26 @@ impl MoshApp {
 
     fn finish_import(&mut self, r: ImportResult, ctx: &egui::Context) {
         match r {
-            ImportResult::Video { name, packet_clip } => {
+            ImportResult::Video { name, packet_clip, audio_clip } => {
                 let clip_idx = self.packet_clips.len();
                 self.packet_clips.push(packet_clip);
                 let frame_count = self.packet_clips[clip_idx].packets.len();
 
-                if self.packet_decoder.is_none() {
-                    match PacketDecoder::new(&self.packet_clips[clip_idx].codec_parameters) {
-                        Ok(dec) => self.packet_decoder = Some(dec),
-                        Err(e) => {
-                            self.status = format!("Decoder init failed: {e}");
-                            return;
+                if self.preview_req_tx.is_none() {
+                    let (req_tx, req_rx) =
+                        mpsc::sync_channel::<(Vec<OwnedPacket>, usize, usize)>(1);
+                    self.preview_req_tx = Some(req_tx);
+                    let params = self.packet_clips[clip_idx].codec_parameters.clone();
+                    let res_tx = self.preview_res_tx.clone();
+                    std::thread::spawn(move || {
+                        let Ok(mut decoder) = PacketDecoder::new(&params) else { return };
+                        while let Ok((packets, target_in_slice, abs_target)) = req_rx.recv() {
+                            let refs: Vec<&OwnedPacket> = packets.iter().collect();
+                            if let Ok(yuv) = decoder.decode_up_to(&refs, target_in_slice) {
+                                let _ = res_tx.send((abs_target, yuv));
+                            }
                         }
-                    }
+                    });
                 }
 
                 let start_frame = self
@@ -242,7 +265,27 @@ impl MoshApp {
                 });
                 self.clip_uid += 1;
                 self.color_idx += 1;
-                self.status = format!("'{}' ready — {} frames.", name, frame_count);
+
+                // Place the embedded audio track (if any) at the same timeline
+                // position as the video clip just added.
+                if let Some(ac) = audio_clip {
+                    let audio_frame_count = ac.peaks.len();
+                    self.audio_clips.push(ac);
+                    let audio_clip_idx = self.audio_clips.len() - 1;
+                    self.timeline.audio_clips.push(AudioTimelineClip {
+                        audio_clip_idx,
+                        start_frame,
+                        frame_count: audio_frame_count,
+                        source_offset: 0,
+                        fade_in_frames: 0,
+                        fade_out_frames: 0,
+                        selected: false,
+                    });
+                    self.timeline.audio_clips.sort_by_key(|c| c.start_frame);
+                    self.status = format!("'{}' ready — {} frames (audio extracted).", name, frame_count);
+                } else {
+                    self.status = format!("'{}' ready — {} frames.", name, frame_count);
+                }
             }
             ImportResult::Audio { name, audio_clip } => {
                 let frame_count = audio_clip.peaks.len();
@@ -839,6 +882,10 @@ impl MoshApp {
 
     // ── Preview ───────────────────────────────────────────────────────────────
 
+    /// Returns the cached preview frame immediately and fires off a background
+    /// decode request when the playhead has moved to a new frame. The UI stays
+    /// responsive because we never block here — the stale cache is shown for at
+    /// most one repaint cycle (≈16 ms) until the worker delivers the new frame.
     fn current_preview_yuv(&mut self) -> Option<Arc<Yuv420>> {
         let (sequence, ph_idx) = build_playback_sequence(
             &self.timeline.clips,
@@ -851,23 +898,30 @@ impl MoshApp {
         }
         let target = ph_idx.unwrap_or(sequence.len().saturating_sub(1));
 
-        if let Some((cached_frame, cached_yuv)) = &self.preview_cache {
-            if *cached_frame == target {
-                return Some(cached_yuv.clone());
+        // Cache hit — return immediately without any decode work.
+        if let Some((cached_frame, ref yuv)) = self.preview_cache {
+            if cached_frame == target {
+                return Some(yuv.clone());
             }
         }
 
-        let decoder = self.packet_decoder.as_mut()?;
-        match decoder.decode_up_to(&sequence, target) {
-            Ok(yuv) => {
-                self.preview_cache = Some((target, yuv.clone()));
-                Some(yuv)
-            }
-            Err(e) => {
-                self.status = format!("Decode error: {e}");
-                None
+        // Cache miss — ask the worker thread to decode this frame.
+        if let Some(req_tx) = &self.preview_req_tx {
+            let kf_start = sequence[..=target]
+                .iter()
+                .rposition(|p| p.is_key)
+                .unwrap_or(0);
+            let packets: Vec<OwnedPacket> =
+                sequence[kf_start..=target].iter().map(|p| (*p).clone()).collect();
+            let target_in_slice = target - kf_start;
+            if req_tx.try_send((packets, target_in_slice, target)).is_err() {
+                // Worker busy; flag so update() schedules a retry repaint.
+                self.preview_dirty = true;
             }
         }
+
+        // Return stale cache while the worker decodes the new frame.
+        self.preview_cache.as_ref().map(|(_, y)| y.clone())
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1038,6 +1092,16 @@ impl eframe::App for MoshApp {
         }
         if self.bake_in_progress {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+
+        // ── Preview results ───────────────────────────────────────────────────
+        while let Ok((abs_target, yuv)) = self.preview_res_rx.try_recv() {
+            self.preview_cache = Some((abs_target, yuv));
+            ctx.request_repaint();
+        }
+        if self.preview_dirty {
+            self.preview_dirty = false;
+            ctx.request_repaint_after(std::time::Duration::from_millis(8));
         }
 
         // ── Keyboard shortcuts ────────────────────────────────────────────────

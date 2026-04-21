@@ -423,7 +423,7 @@ impl TimelinePanel {
                     // Already handled above — playhead + selection set.
                 } else if video_rect.contains(pos) {
                     let hit_track: u8 = if track_rects[1].contains(pos) { 1 } else { 0 };
-                    for (i, clip) in self.clips.iter().enumerate() {
+                    for (i, clip) in self.clips.iter().enumerate().rev() {
                         if clip.track != hit_track {
                             continue;
                         }
@@ -461,14 +461,14 @@ impl TimelinePanel {
                         self.playhead = self.x_to_frame(rect.left(), pos.x).max(0);
                     }
                 } else if audio_rect.contains(pos) {
-                    for (i, clip) in self.audio_clips.iter().enumerate() {
+                    for (i, clip) in self.audio_clips.iter().enumerate().rev() {
                         let cl = self.frame_to_x(rect.left(), clip.start_frame);
                         let cr = self.frame_to_x(rect.left(), clip.end_frame());
                         if pos.x >= cl && pos.x <= cr {
                             clicked_audio = Some(i);
                             let edge_w = HANDLE_W.min((cr - cl) / 3.0);
                             let mode = if shift {
-                                // Shift+drag on left/right half controls fades
+                                // Shift+drag: left half = fade in (drag right), right half = fade out (drag left)
                                 if pos.x < (cl + cr) / 2.0 {
                                     DragMode::FadeIn {
                                         fade_in_start: clip.fade_in_frames,
@@ -511,7 +511,7 @@ impl TimelinePanel {
                 // hover cursor feedback
                 if video_rect.contains(pos) {
                     let hit_track: u8 = if track_rects[1].contains(pos) { 1 } else { 0 };
-                    for clip in &self.clips {
+                    for clip in self.clips.iter().rev() {
                         if clip.track != hit_track {
                             continue;
                         }
@@ -526,7 +526,7 @@ impl TimelinePanel {
                         }
                     }
                 } else if audio_rect.contains(pos) {
-                    for clip in &self.audio_clips {
+                    for clip in self.audio_clips.iter().rev() {
                         let cl = self.frame_to_x(rect.left(), clip.start_frame);
                         let cr = self.frame_to_x(rect.left(), clip.end_frame());
                         if pos.x >= cl && pos.x <= cr {
@@ -594,9 +594,11 @@ impl TimelinePanel {
                                 }
                                 DragMode::TrimIn { start_frame_start, source_offset_start, frame_count_start } => {
                                     let total = audio_sources[self.audio_clips[idx].audio_clip_idx].peaks.len() as i64;
-                                    let new_source_offset = (*source_offset_start as i64 + delta_frames).clamp(0, total - 1) as usize;
-                                    let new_start_frame = (*start_frame_start + delta_frames).max(0);
-                                    let new_frame_count = (*frame_count_start as i64 - delta_frames)
+                                    let raw_start = (*start_frame_start + delta_frames).max(0);
+                                    let new_start_frame = self.snap_frame(raw_start, Some((DragTarget::Audio, idx)));
+                                    let effective_delta = new_start_frame - *start_frame_start;
+                                    let new_source_offset = (*source_offset_start as i64 + effective_delta).clamp(0, total - 1) as usize;
+                                    let new_frame_count = (*frame_count_start as i64 - effective_delta)
                                         .clamp(1, total - new_source_offset as i64) as usize;
                                     let clip = &mut self.audio_clips[idx];
                                     clip.source_offset = new_source_offset;
@@ -606,19 +608,25 @@ impl TimelinePanel {
                                 DragMode::TrimOut { frame_count_start } => {
                                     let total = audio_sources[self.audio_clips[idx].audio_clip_idx].peaks.len() as i64;
                                     let source_offset = self.audio_clips[idx].source_offset as i64;
-                                    let new_frame_count = (*frame_count_start as i64 + delta_frames)
+                                    let raw_end = self.audio_clips[idx].start_frame + *frame_count_start as i64 + delta_frames;
+                                    let snapped_end = self.snap_frame(raw_end, Some((DragTarget::Audio, idx)));
+                                    let new_frame_count = (snapped_end - self.audio_clips[idx].start_frame)
                                         .clamp(1, total - source_offset) as usize;
                                     self.audio_clips[idx].frame_count = new_frame_count;
                                 }
                                 DragMode::FadeIn { fade_in_start } => {
-                                    let delta = delta_frames.max(-(*fade_in_start as i64)) as usize;
                                     let max_fade = self.audio_clips[idx].frame_count / 2;
-                                    self.audio_clips[idx].fade_in_frames = (*fade_in_start + delta).min(max_fade);
+                                    // Drag right increases fade-in.
+                                    self.audio_clips[idx].fade_in_frames =
+                                        ((*fade_in_start as i64) + delta_frames)
+                                            .clamp(0, max_fade as i64) as usize;
                                 }
                                 DragMode::FadeOut { fade_out_start } => {
-                                    let delta = delta_frames.max(-(*fade_out_start as i64)) as usize;
                                     let max_fade = self.audio_clips[idx].frame_count / 2;
-                                    self.audio_clips[idx].fade_out_frames = (*fade_out_start + delta).min(max_fade);
+                                    // Drag left increases fade-out (negate delta so direction is inward).
+                                    self.audio_clips[idx].fade_out_frames =
+                                        ((*fade_out_start as i64) - delta_frames)
+                                            .clamp(0, max_fade as i64) as usize;
                                 }
                             }
                         }
@@ -875,6 +883,32 @@ impl TimelinePanel {
             new_start = snapped;
         }
         new_start
+    }
+
+    /// Snap a single frame position to the nearest clip edge (video or audio).
+    /// Used for trim handles where only one edge is moving.
+    fn snap_frame(&self, frame: i64, exclude: Option<(DragTarget, usize)>) -> i64 {
+        let threshold = ((12.0 / self.zoom).round() as i64).max(1);
+        let mut best: Option<(i64, i64)> = None;
+        for (i, other) in self.clips.iter().enumerate() {
+            if exclude == Some((DragTarget::Video, i)) { continue; }
+            for &edge in &[other.start_frame, other.end_frame()] {
+                let d = (frame - edge).abs();
+                if d <= threshold && best.map_or(true, |(bd, _)| d < bd) {
+                    best = Some((d, edge));
+                }
+            }
+        }
+        for (i, other) in self.audio_clips.iter().enumerate() {
+            if exclude == Some((DragTarget::Audio, i)) { continue; }
+            for &edge in &[other.start_frame, other.end_frame()] {
+                let d = (frame - edge).abs();
+                if d <= threshold && best.map_or(true, |(bd, _)| d < bd) {
+                    best = Some((d, edge));
+                }
+            }
+        }
+        best.map_or(frame, |(_, snapped)| snapped)
     }
 
     /// True if some other clip (on any track) covers the timeline frame
