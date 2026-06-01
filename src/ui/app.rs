@@ -27,6 +27,22 @@ enum ImportResult {
 
 type RenderResult = Result<String, String>;
 
+/// A preview-decode request sent to the background worker:
+/// `(owning pool clip index, that clip's codec parameters, packet slice,
+/// target index within the slice, absolute timeline frame)`.
+///
+/// The clip's own parameters travel with the request because clips carry
+/// different H.264 SPS/PPS (different sources/encoders); the worker (re)creates
+/// its decoder from them whenever the owning clip changes, so any clip decodes
+/// correctly regardless of timeline order.
+type PreviewRequest = (
+    usize,
+    ffmpeg_next::codec::Parameters,
+    Vec<OwnedPacket>,
+    usize,
+    usize,
+);
+
 struct BakeDone {
     clip: PacketClip,
     source_name: String,
@@ -76,7 +92,7 @@ pub struct MoshApp {
     preview_cache: Option<(usize, Arc<Yuv420>)>,
     /// Request channel to the background preview decode thread.
     /// Payload: (packets to decode, target index within that slice, absolute timeline frame).
-    preview_req_tx: Option<mpsc::SyncSender<(Vec<OwnedPacket>, usize, usize)>>,
+    preview_req_tx: Option<mpsc::SyncSender<PreviewRequest>>,
     /// Results from the background decode thread: (absolute timeline frame, decoded image).
     preview_res_rx: mpsc::Receiver<(usize, Arc<Yuv420>)>,
     /// Sender half stored so we can clone it into the worker when it spawns.
@@ -257,22 +273,30 @@ impl MoshApp {
         }
     }
 
-    /// Spawn (once) the background preview-decode worker. All clips share one
-    /// H.264 decoder seeded from the first clip's parameters.
+    /// Spawn (once) the background preview-decode worker. Each request carries
+    /// the codec parameters of the clip that owns the slice's leading keyframe;
+    /// the worker rebuilds its decoder whenever that clip changes, so clips with
+    /// different SPS/PPS all decode correctly regardless of timeline order.
     fn ensure_preview_worker(&mut self) {
         if self.preview_req_tx.is_some() || self.packet_clips.is_empty() {
             return;
         }
-        let (req_tx, req_rx) = mpsc::sync_channel::<(Vec<OwnedPacket>, usize, usize)>(1);
+        let (req_tx, req_rx) = mpsc::sync_channel::<PreviewRequest>(1);
         self.preview_req_tx = Some(req_tx);
-        let params = self.packet_clips[0].codec_parameters.clone();
         let res_tx = self.preview_res_tx.clone();
         std::thread::spawn(move || {
-            let Ok(mut decoder) = PacketDecoder::new(&params) else { return };
-            while let Ok((packets, target_in_slice, abs_target)) = req_rx.recv() {
-                let refs: Vec<&OwnedPacket> = packets.iter().collect();
-                if let Ok(yuv) = decoder.decode_up_to(&refs, target_in_slice) {
-                    let _ = res_tx.send((abs_target, yuv));
+            // (owning clip index, decoder) — rebuilt when the owning clip changes.
+            let mut current: Option<(usize, PacketDecoder)> = None;
+            while let Ok((clip_idx, params, packets, target_in_slice, abs_target)) = req_rx.recv() {
+                let need_new = !matches!(&current, Some((idx, _)) if *idx == clip_idx);
+                if need_new {
+                    current = PacketDecoder::new(&params).ok().map(|d| (clip_idx, d));
+                }
+                if let Some((_, decoder)) = current.as_mut() {
+                    let refs: Vec<&OwnedPacket> = packets.iter().collect();
+                    if let Ok(yuv) = decoder.decode_up_to(&refs, target_in_slice) {
+                        let _ = res_tx.send((abs_target, yuv));
+                    }
                 }
             }
         });
@@ -542,7 +566,7 @@ impl MoshApp {
         let render_packets: Vec<OwnedPacket> = seq_refs
             .iter()
             .enumerate()
-            .map(|(i, pkt)| OwnedPacket {
+            .map(|(i, (pkt, _))| OwnedPacket {
                 data: pkt.data.clone(),
                 pts: i as i64,
                 dts: i as i64,
@@ -550,11 +574,12 @@ impl MoshApp {
                 is_key: pkt.is_key,
             })
             .collect();
+        let leading_clip_idx = seq_refs[0].1;
 
         self.proj_busy = true;
         self.status = "Exporting all platform presets…".into();
         let fps = self.render_fps;
-        let codec_params = self.packet_clips[0].codec_parameters.clone();
+        let codec_params = self.packet_clips[leading_clip_idx].codec_parameters.clone();
         let time_base = ffmpeg_next::Rational(1, fps as i32);
         let total_frames = self.timeline.total_frame_count();
         let audio_sources = self.audio_clips.clone();
@@ -805,22 +830,7 @@ impl MoshApp {
                 self.packet_clips.push(packet_clip);
                 let frame_count = self.packet_clips[clip_idx].packets.len();
 
-                if self.preview_req_tx.is_none() {
-                    let (req_tx, req_rx) =
-                        mpsc::sync_channel::<(Vec<OwnedPacket>, usize, usize)>(1);
-                    self.preview_req_tx = Some(req_tx);
-                    let params = self.packet_clips[clip_idx].codec_parameters.clone();
-                    let res_tx = self.preview_res_tx.clone();
-                    std::thread::spawn(move || {
-                        let Ok(mut decoder) = PacketDecoder::new(&params) else { return };
-                        while let Ok((packets, target_in_slice, abs_target)) = req_rx.recv() {
-                            let refs: Vec<&OwnedPacket> = packets.iter().collect();
-                            if let Ok(yuv) = decoder.decode_up_to(&refs, target_in_slice) {
-                                let _ = res_tx.send((abs_target, yuv));
-                            }
-                        }
-                    });
-                }
+                self.ensure_preview_worker();
 
                 let start_frame = self
                     .timeline
@@ -917,6 +927,32 @@ impl MoshApp {
             self.timeline.validate_mosh_state();
             self.preview_cache = None;
             self.status = format!("Removed {removed_v} video clip(s), {removed_a} audio clip(s) from timeline.");
+        }
+    }
+
+    fn duplicate_selected_clip(&mut self) {
+        if let Some(idx) = self.timeline.selected_video_idx() {
+            let mut new_clip = self.timeline.clips[idx].clone();
+            let end_frame = self.timeline.clips[idx].end_frame();
+            new_clip.id = self.timeline.next_id();
+            new_clip.start_frame = end_frame;
+            new_clip.selected = true;
+            self.timeline.clips[idx].selected = false;
+            self.timeline.clips.push(new_clip);
+            self.timeline.clips.sort_by_key(|c| c.start_frame);
+            self.timeline.validate_mosh_state();
+            self.preview_cache = None;
+            self.status = "Duplicated video clip".to_string();
+        } else if let Some(idx) = self.timeline.selected_audio_idx() {
+            let mut new_clip = self.timeline.audio_clips[idx].clone();
+            let end_frame = self.timeline.audio_clips[idx].end_frame();
+            new_clip.start_frame = end_frame;
+            new_clip.selected = true;
+            self.timeline.audio_clips[idx].selected = false;
+            self.timeline.audio_clips.push(new_clip);
+            self.timeline.audio_clips.sort_by_key(|c| c.start_frame);
+            self.preview_cache = None;
+            self.status = "Duplicated audio clip".to_string();
         }
     }
 
@@ -1387,7 +1423,7 @@ impl MoshApp {
         // keeps every packet exactly one frame long at playback time.
         let mut render_packets: Vec<crate::packet::OwnedPacket> =
             Vec::with_capacity(seq_refs.len());
-        for (i, pkt) in seq_refs.iter().enumerate() {
+        for (i, (pkt, _)) in seq_refs.iter().enumerate() {
             render_packets.push(crate::packet::OwnedPacket {
                 data: pkt.data.clone(),
                 pts: i as i64,
@@ -1396,6 +1432,11 @@ impl MoshApp {
                 is_key: pkt.is_key,
             });
         }
+        // The output stream's codec parameters must match the clip that owns the
+        // leading packet (its keyframe), not always pool clip 0 — clips carry
+        // different SPS/PPS, so a fixed clip-0 would misdeclare the stream and
+        // break decoding whenever another clip leads (e.g. after reordering).
+        let leading_clip_idx = seq_refs[0].1;
 
         let preset = self.export_preset;
         if preset.re_encodes() {
@@ -1412,7 +1453,7 @@ impl MoshApp {
         let fps = self.render_fps;
         let tx = self.render_result_tx.clone();
         let ctx = ctx.clone();
-        let codec_params = self.packet_clips[0].codec_parameters.clone();
+        let codec_params = self.packet_clips[leading_clip_idx].codec_parameters.clone();
         let time_base = ffmpeg_next::Rational(1, fps as i32);
         let total_frames = self.timeline.total_frame_count();
         let audio_sources = self.audio_clips.clone();
@@ -1515,18 +1556,32 @@ impl MoshApp {
             }
         }
 
-        // Cache miss — ask the worker thread to decode this frame.
+        // Cache miss — ask the worker thread to decode this frame. The decoder
+        // is seeded from the clip that owns the slice's leading keyframe, so
+        // clips with different SPS/PPS decode correctly in any order.
         if let Some(req_tx) = &self.preview_req_tx {
             let kf_start = sequence[..=target]
                 .iter()
-                .rposition(|p| p.is_key)
+                .rposition(|(p, _)| p.is_key)
                 .unwrap_or(0);
-            let packets: Vec<OwnedPacket> =
-                sequence[kf_start..=target].iter().map(|p| (*p).clone()).collect();
+            let owner_clip_idx = sequence[kf_start].1;
+            let packets: Vec<OwnedPacket> = sequence[kf_start..=target]
+                .iter()
+                .map(|(p, _)| (*p).clone())
+                .collect();
             let target_in_slice = target - kf_start;
-            if req_tx.try_send((packets, target_in_slice, target)).is_err() {
-                // Worker busy; flag so update() schedules a retry repaint.
-                self.preview_dirty = true;
+            if let Some(params) = self
+                .packet_clips
+                .get(owner_clip_idx)
+                .map(|c| c.codec_parameters.clone())
+            {
+                if req_tx
+                    .try_send((owner_clip_idx, params, packets, target_in_slice, target))
+                    .is_err()
+                {
+                    // Worker busy; flag so update() schedules a retry repaint.
+                    self.preview_dirty = true;
+                }
             }
         }
 
@@ -1587,12 +1642,14 @@ impl MoshApp {
 
 /// Resolve one timeline frame into the packet that feeds the decoder there,
 /// picking the top track (track 0) first and falling back to the bottom
-/// (track 1). Returns `None` when neither track covers the frame.
+/// (track 1). Returns `None` when neither track covers the frame. The second
+/// tuple element is the owning pool-clip index, needed because clips carry
+/// different codec parameters.
 fn resolve_packet_at<'a>(
     clips: &'a [TimelineClip],
     packet_clips: &'a [PacketClip],
     f: i64,
-) -> Option<&'a OwnedPacket> {
+) -> Option<(&'a OwnedPacket, usize)> {
     for track in 0..=1u8 {
         for clip in clips {
             if clip.track != track {
@@ -1604,7 +1661,7 @@ fn resolve_packet_at<'a>(
             let drop_skip = if clip.drop_leading_keyframe { 1 } else { 0 };
             let src_idx = clip.source_offset + drop_skip + (f - clip.start_frame) as usize;
             let packet_clip = packet_clips.get(clip.clip_idx)?;
-            return packet_clip.packets.get(src_idx);
+            return packet_clip.packets.get(src_idx).map(|p| (p, clip.clip_idx));
         }
     }
     None
@@ -1618,15 +1675,15 @@ fn build_playback_sequence<'a>(
     packet_clips: &'a [PacketClip],
     total_frames: i64,
     playhead: i64,
-) -> (Vec<&'a OwnedPacket>, Option<usize>) {
-    let mut seq: Vec<&'a OwnedPacket> = Vec::with_capacity(total_frames.max(0) as usize);
+) -> (Vec<(&'a OwnedPacket, usize)>, Option<usize>) {
+    let mut seq: Vec<(&'a OwnedPacket, usize)> = Vec::with_capacity(total_frames.max(0) as usize);
     let mut ph_idx: Option<usize> = None;
     for f in 0..total_frames {
-        if let Some(p) = resolve_packet_at(clips, packet_clips, f) {
+        if let Some(entry) = resolve_packet_at(clips, packet_clips, f) {
             if f == playhead {
                 ph_idx = Some(seq.len());
             }
-            seq.push(p);
+            seq.push(entry);
         }
     }
     (seq, ph_idx)
@@ -1723,7 +1780,7 @@ impl eframe::App for MoshApp {
         // ── Keyboard shortcuts ────────────────────────────────────────────────
         // Collect intents inside the input closure, then act (acting needs `ctx`,
         // which `ctx.input` has borrowed).
-        let (do_delete, do_new, do_save, do_open, do_undo, do_redo) = ctx.input(|i| {
+        let (do_delete, do_new, do_save, do_open, do_undo, do_redo, do_duplicate) = ctx.input(|i| {
             let cmd = i.modifiers.command;
             let z = i.key_pressed(egui::Key::Z);
             (
@@ -1733,10 +1790,14 @@ impl eframe::App for MoshApp {
                 cmd && i.key_pressed(egui::Key::O),
                 cmd && z && !i.modifiers.shift,
                 cmd && ((z && i.modifiers.shift) || i.key_pressed(egui::Key::Y)),
+                cmd && i.key_pressed(egui::Key::D),
             )
         });
         if do_delete {
             self.remove_selected_clips();
+        }
+        if do_duplicate {
+            self.duplicate_selected_clip();
         }
         if do_new {
             self.request_new_project();
@@ -1903,9 +1964,10 @@ impl eframe::App for MoshApp {
             ui.heading("Operations");
             ui.separator();
 
-            let sel_idx = self.timeline.selected_video_idx();
+            let sel_video = self.timeline.selected_video_idx();
+            let sel_audio = self.timeline.selected_audio_idx();
 
-            if let Some(idx) = sel_idx {
+            if let Some(idx) = sel_video {
                 let name = self.timeline.clips[idx].name.clone();
                 ui.label(format!("Selected: {name}"));
                 ui.add_space(6.0);
@@ -1955,6 +2017,35 @@ impl eframe::App for MoshApp {
                     self.show_compress_dialog = true;
                 }
                 if busy {
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::ProgressBar::new(self.bake_progress)
+                            .show_percentage()
+                            .animate(true),
+                    );
+                    if ui.button("✖ Cancel bake").clicked() {
+                        self.cancel_bake();
+                    }
+                }
+            } else if let Some(idx) = sel_audio {
+                let audio_idx = self.timeline.audio_clips[idx].audio_clip_idx;
+                let name = self.audio_clips[audio_idx].name.clone();
+                ui.label(format!("Selected: {name}"));
+                ui.add_space(6.0);
+                ui.add_enabled(false, egui::Button::new("⚡ Cross-clip mosh"));
+
+                ui.add_space(8.0);
+                if ui.button("🗑 Remove from timeline").clicked() {
+                    self.remove_selected_clips();
+                }
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.heading("Glitch");
+                ui.add_space(4.0);
+                ui.add_enabled(false, egui::Button::new("🌀 Bend at playhead"));
+                ui.add_enabled(false, egui::Button::new("🗜 Compress region"));
+                if self.bake_in_progress {
                     ui.add_space(4.0);
                     ui.add(
                         egui::ProgressBar::new(self.bake_progress)

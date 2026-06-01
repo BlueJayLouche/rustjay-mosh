@@ -9,6 +9,7 @@
 | `Ctrl+O` | Open a `.rjmosh` project |
 | `Ctrl+Z` | Undo |
 | `Ctrl+Shift+Z` | Redo |
+| `Ctrl+D` | Duplicate selected clip directly after itself |
 | `Delete` | Delete selected clip(s) |
 
 > On macOS, `Cmd` stands in for `Ctrl`.
@@ -19,6 +20,7 @@
 |---|---|
 | Select clip | Click body (topmost clip wins when stacked) |
 | Move clip | Drag body |
+| Duplicate clip | `Alt` + drag body (Option on macOS) |
 | Trim in | Drag left edge (snaps to clip edges) |
 | Trim out | Drag right edge (snaps to clip edges) |
 | Fade in (audio) | `Shift` + drag right on the clip's left half |

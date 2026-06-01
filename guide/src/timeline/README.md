@@ -31,4 +31,13 @@ Zoom ranges from a whole-project overview down to individual frames, so you can 
 
 Click a clip's **body** to select it (the topmost clip wins when they're stacked). The selected clip is what the **Operations** panel acts on — mosh, bake, and so on. Press **Delete** to remove selected clips.
 
+## Duplicating clips
+
+There are two ways to duplicate a clip:
+
+- **Alt-drag** (Option-drag on macOS) a clip's **body** to create a copy that follows your mouse from the original position. Release to drop it wherever you want. This works for both video and audio clips.
+- **Ctrl+D** (Cmd+D on macOS) to duplicate the selected clip directly after itself. The new copy is automatically selected, so pressing **Ctrl+D again** chains another duplicate — handy for repeating a clip or building a stutter effect.
+
+Duplicates inherit every property of the original: trim in/out, track assignment, colour, and mosh state. The copy gets a fresh ID and is validated for mosh adjacency as soon as you drop or place it.
+
 Read on for [Trimming & Snapping](trimming.md) and [Audio Tracks & Fades](audio.md).
