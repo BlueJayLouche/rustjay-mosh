@@ -32,7 +32,7 @@ fn format_timecode(frame: i64, fps: u32) -> String {
 // ── Data ─────────────────────────────────────────────────────────────────────
 
 /// A video clip placed on the timeline track.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TimelineClip {
     pub id: u64,
     /// Index into the app's `packet_clips` vector.
@@ -166,10 +166,21 @@ impl TimelinePanel {
         self.selection = None;
     }
 
+    /// True while the user is actively dragging a clip (move/trim/fade). Used to
+    /// defer undo snapshots until the gesture completes.
+    pub fn is_dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
     pub fn next_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    /// Set the id counter so future clips don't collide with loaded ones.
+    pub fn set_next_id(&mut self, v: u64) {
+        self.next_id = v;
     }
 
     pub fn selected_video_idx(&self) -> Option<usize> {

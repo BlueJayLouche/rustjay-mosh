@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
+use std::time::Instant;
 
 use eframe::egui::{self, CursorIcon};
 use eframe::egui_wgpu;
@@ -11,6 +12,8 @@ use crate::codec::ir::Yuv420;
 use crate::importer::import_video;
 use crate::packet::{OwnedPacket, PacketClip};
 use crate::preview::decoder::PacketDecoder;
+use crate::project::{self, LoadedProject, SaveRequest};
+use crate::render::delivery::ExportPreset;
 use crate::render::muxer::export_packets;
 use crate::ui::preview::{YuvPreviewCallback, YuvResources};
 use crate::ui::timeline_panel::{next_clip_color, PoolDragPayload, TimelineClip, TimelinePanel};
@@ -37,6 +40,32 @@ struct BakeDone {
 enum BakeMsg {
     Progress(f32),
     Done(Result<BakeDone, String>),
+}
+
+/// A path chosen in a native dialog, tagged with what the user intends to do.
+enum ProjectRequest {
+    SaveAs(PathBuf),
+    Open(PathBuf),
+    Collect(PathBuf),
+    ExportAll(PathBuf),
+}
+
+/// Result of an async project I/O operation, applied on the main thread.
+enum ProjectMsg {
+    Loaded(Box<LoadedProject>, PathBuf),
+    Collected(PathBuf),
+    ExportedAll(PathBuf),
+    Progress(String),
+    Error(String),
+}
+
+/// Snapshot of the editable timeline state for undo/redo. Holds only the light
+/// edit decisions — never the heavy media (those live in `packet_clips` /
+/// `audio_clips` and are not mutated by undoable operations).
+#[derive(Clone, PartialEq)]
+struct EditSnapshot {
+    clips: Vec<TimelineClip>,
+    audio_clips: Vec<AudioTimelineClip>,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -73,6 +102,7 @@ pub struct MoshApp {
     is_rendering: bool,
     status: String,
     render_fps: u32,
+    export_preset: ExportPreset,
 
     // ── Glitch dialog state ───────────────────────────────────────────────
     show_bend_dialog: bool,
@@ -100,6 +130,27 @@ pub struct MoshApp {
     bake_in_progress: bool,
     bake_progress: f32,
     bake_cancel: Arc<AtomicBool>,
+
+    // ── Project I/O state ─────────────────────────────────────────────────
+    /// The current bundle directory, once the project has been saved/opened.
+    project_path: Option<PathBuf>,
+    /// True when there are unsaved edits.
+    project_dirty: bool,
+    recent_projects: Vec<PathBuf>,
+    /// A recovery bundle left by autosave, if one was found on startup.
+    recovery_available: Option<PathBuf>,
+    proj_req_rx: mpsc::Receiver<ProjectRequest>,
+    proj_req_tx: mpsc::SyncSender<ProjectRequest>,
+    proj_msg_rx: mpsc::Receiver<ProjectMsg>,
+    proj_msg_tx: mpsc::Sender<ProjectMsg>,
+    proj_busy: bool,
+    last_autosave: Instant,
+
+    // ── Undo / redo ───────────────────────────────────────────────────────
+    undo_stack: Vec<EditSnapshot>,
+    redo_stack: Vec<EditSnapshot>,
+    /// The last committed editing state, used to detect new edit points.
+    last_snapshot: EditSnapshot,
 }
 
 impl MoshApp {
@@ -116,6 +167,13 @@ impl MoshApp {
         let (render_result_tx, render_result_rx) = mpsc::sync_channel(1);
         let (bake_tx, bake_rx) = mpsc::sync_channel(64);
         let (preview_res_tx, preview_res_rx) = mpsc::channel();
+        let (proj_req_tx, proj_req_rx) = mpsc::sync_channel(1);
+        let (proj_msg_tx, proj_msg_rx) = mpsc::channel();
+
+        // Offer crash recovery if a previous session left an autosave bundle.
+        let recovery_available = project::autosave_path()
+            .filter(|p| p.join("project.json").exists());
+
         Self {
             packet_clips: vec![],
             audio_clips: vec![],
@@ -138,6 +196,7 @@ impl MoshApp {
             is_rendering: false,
             status: "Open a video or audio file to begin.".into(),
             render_fps: 30,
+            export_preset: ExportPreset::RawMosh,
 
             show_bend_dialog: false,
             bend_mode: 0,
@@ -152,8 +211,8 @@ impl MoshApp {
             show_compress_dialog: false,
             compress_x: 0,
             compress_y: 0,
-            compress_w: 1280,
-            compress_h: 720,
+            compress_w: 1920,
+            compress_h: 1080,
             compress_quality: 15,
             compress_duration: 0,
             compress_dialog_clip_id: None,
@@ -163,6 +222,463 @@ impl MoshApp {
             bake_in_progress: false,
             bake_progress: 0.0,
             bake_cancel: Arc::new(AtomicBool::new(false)),
+
+            project_path: None,
+            project_dirty: false,
+            recent_projects: project::load_recent(),
+            recovery_available,
+            proj_req_rx,
+            proj_req_tx,
+            proj_msg_rx,
+            proj_msg_tx,
+            proj_busy: false,
+            last_autosave: Instant::now(),
+
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            last_snapshot: EditSnapshot { clips: Vec::new(), audio_clips: Vec::new() },
+        }
+    }
+
+    // ── Project I/O ───────────────────────────────────────────────────────────
+
+    /// Snapshot the current editable timeline state.
+    fn snapshot(&self) -> EditSnapshot {
+        EditSnapshot {
+            clips: self.timeline.clips.clone(),
+            audio_clips: self.timeline.audio_clips.clone(),
+        }
+    }
+
+    /// Spawn (once) the background preview-decode worker. All clips share one
+    /// H.264 decoder seeded from the first clip's parameters.
+    fn ensure_preview_worker(&mut self) {
+        if self.preview_req_tx.is_some() || self.packet_clips.is_empty() {
+            return;
+        }
+        let (req_tx, req_rx) = mpsc::sync_channel::<(Vec<OwnedPacket>, usize, usize)>(1);
+        self.preview_req_tx = Some(req_tx);
+        let params = self.packet_clips[0].codec_parameters.clone();
+        let res_tx = self.preview_res_tx.clone();
+        std::thread::spawn(move || {
+            let Ok(mut decoder) = PacketDecoder::new(&params) else { return };
+            while let Ok((packets, target_in_slice, abs_target)) = req_rx.recv() {
+                let refs: Vec<&OwnedPacket> = packets.iter().collect();
+                if let Ok(yuv) = decoder.decode_up_to(&refs, target_in_slice) {
+                    let _ = res_tx.send((abs_target, yuv));
+                }
+            }
+        });
+    }
+
+    /// Mark the project as having unsaved edits.
+    fn mark_dirty(&mut self) {
+        self.project_dirty = true;
+    }
+
+    fn project_title(&self) -> String {
+        let name = self
+            .project_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "untitled".into());
+        if self.project_dirty {
+            format!("{name} *")
+        } else {
+            name
+        }
+    }
+
+    /// Build a borrowed save request over the current live state.
+    fn save_request(&self) -> SaveRequest<'_> {
+        SaveRequest {
+            packet_clips: &self.packet_clips,
+            audio_clips: &self.audio_clips,
+            video_timeline: &self.timeline.clips,
+            audio_timeline: &self.timeline.audio_clips,
+            render_fps: self.render_fps,
+            export_preset: self.export_preset,
+            zoom: self.timeline.zoom,
+            playhead: self.timeline.playhead,
+        }
+    }
+
+    /// Save synchronously to `dir`. Media writes are usually quick (remux only),
+    /// so this runs inline; the UI shows the result via `status`.
+    fn save_to(&mut self, dir: PathBuf) {
+        let req = self.save_request();
+        match project::save_bundle(&dir, &req) {
+            Ok(()) => {
+                self.project_path = Some(dir.clone());
+                self.project_dirty = false;
+                project::push_recent(&dir);
+                self.recent_projects = project::load_recent();
+                // A clean save supersedes any stale recovery snapshot.
+                if let Some(rec) = project::autosave_path() {
+                    let _ = std::fs::remove_dir_all(&rec);
+                }
+                self.recovery_available = None;
+                self.status = format!("Saved project → {}", dir.display());
+            }
+            Err(e) => self.status = format!("Save failed: {e}"),
+        }
+    }
+
+    /// Ctrl+S: save in place if we have a path, else prompt for one.
+    fn save_or_prompt(&mut self, ctx: &egui::Context) {
+        if let Some(dir) = self.project_path.clone() {
+            self.save_to(dir);
+        } else {
+            self.prompt_save_as(ctx);
+        }
+    }
+
+    fn prompt_save_as(&self, ctx: &egui::Context) {
+        let tx = self.proj_req_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Some(p) = rfd::FileDialog::new()
+                .add_filter("rustjay-mosh project", &[project::BUNDLE_EXT])
+                .set_file_name(format!("untitled.{}", project::BUNDLE_EXT))
+                .save_file()
+            {
+                let _ = tx.send(ProjectRequest::SaveAs(p));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn prompt_open(&self, ctx: &egui::Context) {
+        let tx = self.proj_req_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                let _ = tx.send(ProjectRequest::Open(p));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn prompt_collect(&self, ctx: &egui::Context) {
+        let tx = self.proj_req_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Some(p) = rfd::FileDialog::new()
+                .add_filter("Zip archive", &["zip"])
+                .set_file_name("project_bundle.zip")
+                .save_file()
+            {
+                let _ = tx.send(ProjectRequest::Collect(p));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn prompt_export_all(&self, ctx: &egui::Context) {
+        let tx = self.proj_req_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                let _ = tx.send(ProjectRequest::ExportAll(p));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Dispatch a dialog result to the appropriate async worker.
+    fn handle_project_request(&mut self, req: ProjectRequest, ctx: &egui::Context) {
+        match req {
+            ProjectRequest::SaveAs(dir) => self.save_to(dir),
+            ProjectRequest::Open(dir) => self.start_open(dir, ctx),
+            ProjectRequest::Collect(zip) => self.start_collect(zip, ctx),
+            ProjectRequest::ExportAll(dir) => self.start_export_all(dir, ctx),
+        }
+    }
+
+    /// Load a project bundle on a background thread.
+    fn start_open(&mut self, dir: PathBuf, ctx: &egui::Context) {
+        self.proj_busy = true;
+        self.status = format!("Opening {}…", dir.display());
+        let tx = self.proj_msg_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let msg = match project::load_bundle(&dir) {
+                Ok(lp) => ProjectMsg::Loaded(Box::new(lp), dir),
+                Err(e) => ProjectMsg::Error(format!("Open failed: {e}")),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Build a fresh bundle in a temp dir and zip it — works even if the
+    /// project has never been saved to a permanent location.
+    fn start_collect(&mut self, zip_path: PathBuf, ctx: &egui::Context) {
+        self.proj_busy = true;
+        self.status = "Collecting files into a shareable zip…".into();
+        // The save request borrows self; snapshot owned copies for the thread.
+        let packet_clips = self.packet_clips.clone();
+        let audio_clips = self.audio_clips.clone();
+        let video_timeline = self.timeline.clips.clone();
+        let audio_timeline = self.timeline.audio_clips.clone();
+        let render_fps = self.render_fps;
+        let export_preset = self.export_preset;
+        let zoom = self.timeline.zoom;
+        let playhead = self.timeline.playhead;
+        let tx = self.proj_msg_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let msg = (|| -> Result<PathBuf, String> {
+                let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+                let bundle = tmp.path().join(
+                    zip_path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "project".into()),
+                );
+                let req = SaveRequest {
+                    packet_clips: &packet_clips,
+                    audio_clips: &audio_clips,
+                    video_timeline: &video_timeline,
+                    audio_timeline: &audio_timeline,
+                    render_fps,
+                    export_preset,
+                    zoom,
+                    playhead,
+                };
+                project::save_bundle(&bundle, &req).map_err(|e| e.to_string())?;
+                project::collect_zip(&bundle, &zip_path).map_err(|e| e.to_string())?;
+                Ok(zip_path)
+            })();
+            let _ = tx.send(match msg {
+                Ok(p) => ProjectMsg::Collected(p),
+                Err(e) => ProjectMsg::Error(format!("Collect failed: {e}")),
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Render the timeline through every platform preset into `dir`.
+    fn start_export_all(&mut self, dir: PathBuf, ctx: &egui::Context) {
+        if self.timeline.clips.is_empty() {
+            self.status = "Nothing on the timeline to export.".into();
+            return;
+        }
+        let (seq_refs, _) = build_playback_sequence(
+            &self.timeline.clips,
+            &self.packet_clips,
+            self.timeline.total_frame_count() as i64,
+            self.timeline.playhead,
+        );
+        if seq_refs.is_empty() {
+            self.status = "Nothing on the timeline to export.".into();
+            return;
+        }
+        let render_packets: Vec<OwnedPacket> = seq_refs
+            .iter()
+            .enumerate()
+            .map(|(i, pkt)| OwnedPacket {
+                data: pkt.data.clone(),
+                pts: i as i64,
+                dts: i as i64,
+                duration: 1,
+                is_key: pkt.is_key,
+            })
+            .collect();
+
+        self.proj_busy = true;
+        self.status = "Exporting all platform presets…".into();
+        let fps = self.render_fps;
+        let codec_params = self.packet_clips[0].codec_parameters.clone();
+        let time_base = ffmpeg_next::Rational(1, fps as i32);
+        let total_frames = self.timeline.total_frame_count();
+        let audio_sources = self.audio_clips.clone();
+        let audio_timeline: Vec<AudioTimelineClip> = self.timeline.audio_clips.clone();
+        let tx = self.proj_msg_tx.clone();
+        let ctx = ctx.clone();
+
+        std::thread::spawn(move || {
+            let result = (|| -> Result<PathBuf, String> {
+                let temp_dir = tempfile::tempdir().map_err(|e| format!("Temp dir: {e}"))?;
+                let video_temp = temp_dir.path().join("video.mp4");
+                export_packets(&render_packets, &video_temp, &codec_params, time_base)
+                    .map_err(|e| format!("Export: {e}"))?;
+
+                let audio_temp_path: Option<String> = if !audio_timeline.is_empty() {
+                    let audio_temp = temp_dir.path().join("audio.wav");
+                    crate::audio::render_audio_mix(
+                        &audio_sources,
+                        &audio_timeline,
+                        total_frames,
+                        fps,
+                        &audio_temp,
+                    )
+                    .map_err(|e| format!("Audio mix: {e}"))?;
+                    Some(audio_temp.to_string_lossy().into_owned())
+                } else {
+                    None
+                };
+
+                for preset in ExportPreset::ALL_PLATFORMS {
+                    let _ = tx.send(ProjectMsg::Progress(format!(
+                        "Exporting {}…",
+                        preset.label()
+                    )));
+                    ctx.request_repaint();
+                    let out = dir.join(format!("mosh_{}.mp4", preset.file_tag()));
+                    let args = preset.build_ffmpeg_args(
+                        &video_temp.to_string_lossy(),
+                        audio_temp_path.as_deref(),
+                        &out.to_string_lossy(),
+                        fps,
+                    );
+                    let output = std::process::Command::new(crate::bundled_ffmpeg())
+                        .args(&args)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::piped())
+                        .output()
+                        .map_err(|e| format!("ffmpeg launch: {e}"))?;
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        return Err(format!("{} failed: {stderr}", preset.label()));
+                    }
+                }
+                Ok(dir)
+            })();
+            let _ = tx.send(match result {
+                Ok(p) => ProjectMsg::ExportedAll(p),
+                Err(e) => ProjectMsg::Error(format!("Export-all failed: {e}")),
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Replace all live state with a freshly loaded project.
+    fn apply_loaded(&mut self, lp: LoadedProject, path: PathBuf) {
+        self.packet_clips = lp.packet_clips;
+        self.audio_clips = lp.audio_clips;
+        self.timeline.clips = lp.video_timeline;
+        self.timeline.audio_clips = lp.audio_timeline;
+        self.render_fps = lp.render_fps;
+        self.export_preset = lp.export_preset;
+        self.timeline.zoom = lp.zoom;
+        self.timeline.playhead = lp.playhead;
+        self.timeline.clear_selection();
+
+        let max_tl_id = self.timeline.clips.iter().map(|c| c.id).max().unwrap_or(0);
+        self.timeline.set_next_id(max_tl_id + 1);
+        self.clip_uid = self.packet_clips.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+        self.color_idx = self.timeline.clips.len();
+
+        // Fresh preview worker for the loaded media.
+        self.preview_req_tx = None;
+        self.preview_cache = None;
+        self.ensure_preview_worker();
+
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_snapshot = self.snapshot();
+
+        self.project_path = Some(path.clone());
+        self.project_dirty = false;
+        self.recovery_available = None;
+        project::push_recent(&path);
+        self.recent_projects = project::load_recent();
+        self.status = format!("Opened {}", path.display());
+    }
+
+    /// Drain the project dialog + result channels.
+    fn poll_project_io(&mut self, ctx: &egui::Context) {
+        if let Ok(req) = self.proj_req_rx.try_recv() {
+            self.handle_project_request(req, ctx);
+        }
+        while let Ok(msg) = self.proj_msg_rx.try_recv() {
+            match msg {
+                ProjectMsg::Loaded(lp, path) => {
+                    self.proj_busy = false;
+                    self.apply_loaded(*lp, path);
+                }
+                ProjectMsg::Collected(zip) => {
+                    self.proj_busy = false;
+                    self.status = format!("Collected shareable bundle → {}", zip.display());
+                }
+                ProjectMsg::ExportedAll(dir) => {
+                    self.proj_busy = false;
+                    self.status = format!("Exported all platform presets → {}", dir.display());
+                }
+                ProjectMsg::Progress(s) => self.status = s,
+                ProjectMsg::Error(e) => {
+                    self.proj_busy = false;
+                    self.status = e;
+                }
+            }
+        }
+    }
+
+    /// Periodically write a recovery bundle so a crash doesn't lose work.
+    fn maybe_autosave(&mut self) {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+        if !self.project_dirty || self.proj_busy || self.bake_in_progress || self.is_rendering {
+            return;
+        }
+        if self.last_autosave.elapsed() < INTERVAL {
+            return;
+        }
+        self.last_autosave = Instant::now();
+        if let Some(dir) = project::autosave_path() {
+            let req = self.save_request();
+            match project::save_bundle(&dir, &req) {
+                Ok(()) => self.status = "Autosaved recovery snapshot.".into(),
+                Err(e) => self.status = format!("Autosave failed: {e}"),
+            }
+        }
+    }
+
+    /// Detect a completed edit (timeline state changed while not mid-drag) and
+    /// push the previous state onto the undo stack.
+    fn commit_edit_if_changed(&mut self) {
+        if self.timeline.is_dragging() {
+            return;
+        }
+        let current = self.snapshot();
+        if current != self.last_snapshot {
+            self.undo_stack.push(std::mem::replace(&mut self.last_snapshot, current));
+            self.redo_stack.clear();
+            if self.undo_stack.len() > 100 {
+                self.undo_stack.remove(0);
+            }
+            self.mark_dirty();
+        }
+    }
+
+    fn undo(&mut self) {
+        if let Some(prev) = self.undo_stack.pop() {
+            let current = self.snapshot();
+            self.redo_stack.push(current);
+            self.timeline.clips = prev.clips.clone();
+            self.timeline.audio_clips = prev.audio_clips.clone();
+            self.last_snapshot = prev;
+            self.preview_cache = None;
+            self.mark_dirty();
+            self.status = "Undo".into();
+        } else {
+            self.status = "Nothing to undo.".into();
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            self.undo_stack.push(self.snapshot());
+            self.timeline.clips = next.clips.clone();
+            self.timeline.audio_clips = next.audio_clips.clone();
+            self.last_snapshot = next;
+            self.preview_cache = None;
+            self.mark_dirty();
+            self.status = "Redo".into();
+        } else {
+            self.status = "Nothing to redo.".into();
         }
     }
 
@@ -784,7 +1300,16 @@ impl MoshApp {
             });
         }
 
-        self.status = format!("Rendering {} video packets…", render_packets.len());
+        let preset = self.export_preset;
+        if preset.re_encodes() {
+            self.status = format!(
+                "Encoding delivery master ({}) — {} packets…",
+                preset.label(),
+                render_packets.len()
+            );
+        } else {
+            self.status = format!("Rendering {} video packets…", render_packets.len());
+        }
         self.is_rendering = true;
 
         let fps = self.render_fps;
@@ -821,12 +1346,7 @@ impl MoshApp {
                 return;
             }
 
-            let mut ffmpeg_args = vec![
-                "-y".to_string(),
-                "-i".to_string(), video_temp.to_string_lossy().into_owned(),
-            ];
-
-            if !audio_timeline.is_empty() {
+            let audio_temp_path: Option<String> = if !audio_timeline.is_empty() {
                 let audio_temp = temp_dir.path().join("audio.wav");
                 if let Err(e) = crate::audio::render_audio_mix(
                     &audio_sources,
@@ -839,24 +1359,17 @@ impl MoshApp {
                     ctx.request_repaint();
                     return;
                 }
-                ffmpeg_args.push("-i".to_string());
-                ffmpeg_args.push(audio_temp.to_string_lossy().into_owned());
-                ffmpeg_args.push("-map".to_string());
-                ffmpeg_args.push("0:v:0".to_string());
-                ffmpeg_args.push("-map".to_string());
-                ffmpeg_args.push("1:a:0".to_string());
-                ffmpeg_args.push("-c:v".to_string());
-                ffmpeg_args.push("copy".to_string());
-                ffmpeg_args.push("-c:a".to_string());
-                ffmpeg_args.push("aac".to_string());
-                ffmpeg_args.push("-b:a".to_string());
-                ffmpeg_args.push("192k".to_string());
+                Some(audio_temp.to_string_lossy().into_owned())
             } else {
-                ffmpeg_args.push("-c:v".to_string());
-                ffmpeg_args.push("copy".to_string());
-            }
+                None
+            };
 
-            ffmpeg_args.push(output_path.to_string_lossy().into_owned());
+            let ffmpeg_args = preset.build_ffmpeg_args(
+                &video_temp.to_string_lossy(),
+                audio_temp_path.as_deref(),
+                &output_path.to_string_lossy(),
+                fps,
+            );
 
             let ffmpeg_output = std::process::Command::new(crate::bundled_ffmpeg())
                 .args(&ffmpeg_args)
@@ -1064,6 +1577,12 @@ impl eframe::App for MoshApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
 
+        // Project save/load/collect/export-all dialogs and results.
+        self.poll_project_io(ctx);
+        if self.proj_busy {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+
         // Drain bake messages (progress + completion).
         loop {
             match self.bake_rx.try_recv() {
@@ -1105,26 +1624,128 @@ impl eframe::App for MoshApp {
         }
 
         // ── Keyboard shortcuts ────────────────────────────────────────────────
-        ctx.input(|i| {
-            if i.key_pressed(egui::Key::Delete) {
-                self.remove_selected_clips();
-            }
+        // Collect intents inside the input closure, then act (acting needs `ctx`,
+        // which `ctx.input` has borrowed).
+        let (do_delete, do_save, do_open, do_undo, do_redo) = ctx.input(|i| {
+            let cmd = i.modifiers.command;
+            let z = i.key_pressed(egui::Key::Z);
+            (
+                i.key_pressed(egui::Key::Delete),
+                cmd && i.key_pressed(egui::Key::S),
+                cmd && i.key_pressed(egui::Key::O),
+                cmd && z && !i.modifiers.shift,
+                cmd && ((z && i.modifiers.shift) || i.key_pressed(egui::Key::Y)),
+            )
         });
+        if do_delete {
+            self.remove_selected_clips();
+        }
+        if do_undo {
+            self.undo();
+        }
+        if do_redo {
+            self.redo();
+        }
+        if do_save {
+            self.save_or_prompt(ctx);
+        }
+        if do_open {
+            self.prompt_open(ctx);
+        }
 
         // ── Top bar ───────────────────────────────────────────────────────────
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                ui.menu_button("📁 Project", |ui| {
+                    if ui.button("Save        Ctrl+S").clicked() {
+                        self.save_or_prompt(ctx);
+                        ui.close_menu();
+                    }
+                    if ui.button("Save As…").clicked() {
+                        self.prompt_save_as(ctx);
+                        ui.close_menu();
+                    }
+                    if ui.button("Open…       Ctrl+O").clicked() {
+                        self.prompt_open(ctx);
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    ui.add_enabled_ui(!self.recent_projects.is_empty(), |ui| {
+                        ui.menu_button("Recent projects", |ui| {
+                            let recent = self.recent_projects.clone();
+                            for path in &recent {
+                                let label = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                                if ui.button(label).on_hover_text(path.to_string_lossy()).clicked() {
+                                    self.start_open(path.clone(), ctx);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    });
+                    ui.separator();
+                    if ui.button("Collect files to share (.zip)…").clicked() {
+                        self.prompt_collect(ctx);
+                        ui.close_menu();
+                    }
+                    let can_export = !self.timeline.clips.is_empty();
+                    if ui
+                        .add_enabled(can_export, egui::Button::new("Export for all platforms…"))
+                        .clicked()
+                    {
+                        self.prompt_export_all(ctx);
+                        ui.close_menu();
+                    }
+                });
+
+                ui.separator();
                 if ui.button("➕ Import clip").clicked() {
                     self.open_file(ctx);
                 }
-                if self.is_rendering {
+
+                ui.separator();
+                if ui
+                    .add_enabled(!self.undo_stack.is_empty(), egui::Button::new("↶ Undo"))
+                    .on_hover_text("Ctrl+Z")
+                    .clicked()
+                {
+                    self.undo();
+                }
+                if ui
+                    .add_enabled(!self.redo_stack.is_empty(), egui::Button::new("↷ Redo"))
+                    .on_hover_text("Ctrl+Shift+Z")
+                    .clicked()
+                {
+                    self.redo();
+                }
+
+                if self.is_rendering || self.proj_busy {
                     ui.separator();
                     ui.spinner();
-                    ui.label("Rendering…");
                 }
                 ui.separator();
+                ui.label(format!("[{}]", self.project_title()));
                 ui.label(&self.status);
             });
+
+            // Crash-recovery offer (only until dismissed/used).
+            if let Some(rec) = self.recovery_available.clone() {
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 180, 60),
+                        "⚠ An autosaved recovery snapshot was found.",
+                    );
+                    if ui.button("Recover").clicked() {
+                        self.recovery_available = None;
+                        self.start_open(rec.clone(), ctx);
+                    }
+                    if ui.button("Dismiss").clicked() {
+                        self.recovery_available = None;
+                    }
+                });
+            }
         });
 
         // ── Pool sidebar ──────────────────────────────────────────────────────
@@ -1271,6 +1892,33 @@ impl eframe::App for MoshApp {
                 ui.add(egui::DragValue::new(&mut self.render_fps).range(1..=120));
             });
             ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Preset:");
+                egui::ComboBox::from_id_salt("export_preset")
+                    .selected_text(self.export_preset.label())
+                    .show_ui(ui, |ui| {
+                        for preset in ExportPreset::ALL {
+                            ui.selectable_value(
+                                &mut self.export_preset,
+                                preset,
+                                preset.label(),
+                            );
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Re-encodes the moshed output into a clean, platform-shaped \
+                         master. The glitch lives in the pixels, so it survives — but \
+                         the platform now compresses from a pristine source instead of \
+                         mangling the fragile mosh bitstream.",
+                    );
+            });
+            ui.label(
+                egui::RichText::new(self.export_preset.description())
+                    .small()
+                    .weak(),
+            );
+            ui.add_space(4.0);
             if self.is_rendering {
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -1350,5 +1998,10 @@ impl eframe::App for MoshApp {
         // ── Glitch dialogs ────────────────────────────────────────────────────
         self.draw_bend_dialog(ctx);
         self.draw_compress_dialog(ctx);
+
+        // End-of-frame bookkeeping: capture an undo point if the timeline
+        // changed this frame, then run the autosave heartbeat.
+        self.commit_edit_if_changed();
+        self.maybe_autosave();
     }
 }

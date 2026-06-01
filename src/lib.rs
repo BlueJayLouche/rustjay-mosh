@@ -7,6 +7,7 @@ pub mod frame_graph;
 pub mod importer;
 pub mod packet;
 pub mod preview;
+pub mod project;
 pub mod render;
 pub mod timeline;
 pub mod ui;

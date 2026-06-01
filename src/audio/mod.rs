@@ -29,7 +29,7 @@ pub struct AudioClip {
     pub peaks: Vec<Peak>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AudioTimelineClip {
     pub audio_clip_idx: usize,
     pub start_frame: i64,
@@ -97,8 +97,43 @@ pub fn import_audio(
     })
 }
 
+/// Read a 32-bit-float WAV (as written by [`render_audio_mix`]) back into an
+/// `AudioClip`. Used when loading a saved project bundle. Peaks are recomputed
+/// for the given project fps.
+pub fn read_audio_clip_from_wav(
+    path: &Path,
+    name: impl Into<String>,
+    project_fps: u32,
+) -> Result<AudioClip, AudioError> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => {
+            reader.samples::<f32>().collect::<Result<_, _>>()?
+        }
+        hound::SampleFormat::Int => {
+            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|s| s.map(|v| v as f32 / max))
+                .collect::<Result<_, _>>()?
+        }
+    };
+    let channels = spec.channels as usize;
+    let sample_rate = spec.sample_rate;
+    let peaks = compute_peaks(&samples, sample_rate, channels.max(1), project_fps);
+
+    Ok(AudioClip {
+        name: name.into(),
+        samples,
+        sample_rate,
+        channels,
+        peaks,
+    })
+}
+
 /// Compute min/max peak per video frame.
-fn compute_peaks(samples: &[f32], sample_rate: u32, channels: usize, fps: u32) -> Vec<Peak> {
+pub(crate) fn compute_peaks(samples: &[f32], sample_rate: u32, channels: usize, fps: u32) -> Vec<Peak> {
     let samples_per_frame = (sample_rate as usize * channels) / fps as usize;
     if samples_per_frame == 0 {
         return vec![];
