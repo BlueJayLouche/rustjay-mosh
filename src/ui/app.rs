@@ -930,6 +930,32 @@ impl MoshApp {
         }
     }
 
+    fn duplicate_selected_clip(&mut self) {
+        if let Some(idx) = self.timeline.selected_video_idx() {
+            let mut new_clip = self.timeline.clips[idx].clone();
+            let end_frame = self.timeline.clips[idx].end_frame();
+            new_clip.id = self.timeline.next_id();
+            new_clip.start_frame = end_frame;
+            new_clip.selected = true;
+            self.timeline.clips[idx].selected = false;
+            self.timeline.clips.push(new_clip);
+            self.timeline.clips.sort_by_key(|c| c.start_frame);
+            self.timeline.validate_mosh_state();
+            self.preview_cache = None;
+            self.status = "Duplicated video clip".to_string();
+        } else if let Some(idx) = self.timeline.selected_audio_idx() {
+            let mut new_clip = self.timeline.audio_clips[idx].clone();
+            let end_frame = self.timeline.audio_clips[idx].end_frame();
+            new_clip.start_frame = end_frame;
+            new_clip.selected = true;
+            self.timeline.audio_clips[idx].selected = false;
+            self.timeline.audio_clips.push(new_clip);
+            self.timeline.audio_clips.sort_by_key(|c| c.start_frame);
+            self.preview_cache = None;
+            self.status = "Duplicated audio clip".to_string();
+        }
+    }
+
     // ── Glitch dialogs ────────────────────────────────────────────────────────
 
     /// Confirmation modal for "New Project" when there are unsaved changes.
@@ -1754,7 +1780,7 @@ impl eframe::App for MoshApp {
         // ── Keyboard shortcuts ────────────────────────────────────────────────
         // Collect intents inside the input closure, then act (acting needs `ctx`,
         // which `ctx.input` has borrowed).
-        let (do_delete, do_new, do_save, do_open, do_undo, do_redo) = ctx.input(|i| {
+        let (do_delete, do_new, do_save, do_open, do_undo, do_redo, do_duplicate) = ctx.input(|i| {
             let cmd = i.modifiers.command;
             let z = i.key_pressed(egui::Key::Z);
             (
@@ -1764,10 +1790,14 @@ impl eframe::App for MoshApp {
                 cmd && i.key_pressed(egui::Key::O),
                 cmd && z && !i.modifiers.shift,
                 cmd && ((z && i.modifiers.shift) || i.key_pressed(egui::Key::Y)),
+                cmd && i.key_pressed(egui::Key::D),
             )
         });
         if do_delete {
             self.remove_selected_clips();
+        }
+        if do_duplicate {
+            self.duplicate_selected_clip();
         }
         if do_new {
             self.request_new_project();
@@ -1934,9 +1964,10 @@ impl eframe::App for MoshApp {
             ui.heading("Operations");
             ui.separator();
 
-            let sel_idx = self.timeline.selected_video_idx();
+            let sel_video = self.timeline.selected_video_idx();
+            let sel_audio = self.timeline.selected_audio_idx();
 
-            if let Some(idx) = sel_idx {
+            if let Some(idx) = sel_video {
                 let name = self.timeline.clips[idx].name.clone();
                 ui.label(format!("Selected: {name}"));
                 ui.add_space(6.0);
@@ -1986,6 +2017,35 @@ impl eframe::App for MoshApp {
                     self.show_compress_dialog = true;
                 }
                 if busy {
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::ProgressBar::new(self.bake_progress)
+                            .show_percentage()
+                            .animate(true),
+                    );
+                    if ui.button("✖ Cancel bake").clicked() {
+                        self.cancel_bake();
+                    }
+                }
+            } else if let Some(idx) = sel_audio {
+                let audio_idx = self.timeline.audio_clips[idx].audio_clip_idx;
+                let name = self.audio_clips[audio_idx].name.clone();
+                ui.label(format!("Selected: {name}"));
+                ui.add_space(6.0);
+                ui.add_enabled(false, egui::Button::new("⚡ Cross-clip mosh"));
+
+                ui.add_space(8.0);
+                if ui.button("🗑 Remove from timeline").clicked() {
+                    self.remove_selected_clips();
+                }
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.heading("Glitch");
+                ui.add_space(4.0);
+                ui.add_enabled(false, egui::Button::new("🌀 Bend at playhead"));
+                ui.add_enabled(false, egui::Button::new("🗜 Compress region"));
+                if self.bake_in_progress {
                     ui.add_space(4.0);
                     ui.add(
                         egui::ProgressBar::new(self.bake_progress)

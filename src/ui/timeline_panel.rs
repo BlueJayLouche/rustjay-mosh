@@ -356,7 +356,7 @@ impl TimelinePanel {
         }
 
         // ── Input ────────────────────────────────────────────────────────────
-        let (pointer_pos, pressed, released, down, _p_delta, scroll, ctrl, shift) = ui.input(|i| {
+        let (pointer_pos, pressed, released, down, _p_delta, scroll, ctrl, shift, alt) = ui.input(|i| {
             (
                 i.pointer.interact_pos(),
                 i.pointer.button_pressed(egui::PointerButton::Primary),
@@ -366,6 +366,7 @@ impl TimelinePanel {
                 i.smooth_scroll_delta,
                 i.modifiers.ctrl,
                 i.modifiers.shift,
+                i.modifiers.alt,
             )
         });
 
@@ -434,6 +435,7 @@ impl TimelinePanel {
                     // Already handled above — playhead + selection set.
                 } else if video_rect.contains(pos) {
                     let hit_track: u8 = if track_rects[1].contains(pos) { 1 } else { 0 };
+                    let mut duplicate_video: Option<TimelineClip> = None;
                     for (i, clip) in self.clips.iter().enumerate().rev() {
                         if clip.track != hit_track {
                             continue;
@@ -441,46 +443,73 @@ impl TimelinePanel {
                         let cl = self.frame_to_x(rect.left(), clip.start_frame);
                         let cr = self.frame_to_x(rect.left(), clip.end_frame());
                         if pos.x >= cl && pos.x <= cr {
-                            clicked_video = Some(i);
                             let edge_w = HANDLE_W.min((cr - cl) / 3.0);
-                            let mode = if pos.x < cl + edge_w {
-                                DragMode::TrimIn {
-                                    start_frame_start: clip.start_frame,
-                                    source_offset_start: clip.source_offset,
-                                    frame_count_start: clip.frame_count,
-                                }
+                            if pos.x < cl + edge_w {
+                                clicked_video = Some(i);
+                                self.drag = Some(DragState {
+                                    target: DragTarget::Video,
+                                    clip_idx: i,
+                                    pointer_start_x: pos.x,
+                                    mode: DragMode::TrimIn {
+                                        start_frame_start: clip.start_frame,
+                                        source_offset_start: clip.source_offset,
+                                        frame_count_start: clip.frame_count,
+                                    },
+                                });
                             } else if pos.x > cr - edge_w {
-                                DragMode::TrimOut {
-                                    frame_count_start: clip.frame_count,
-                                }
+                                clicked_video = Some(i);
+                                self.drag = Some(DragState {
+                                    target: DragTarget::Video,
+                                    clip_idx: i,
+                                    pointer_start_x: pos.x,
+                                    mode: DragMode::TrimOut {
+                                        frame_count_start: clip.frame_count,
+                                    },
+                                });
+                            } else if alt {
+                                duplicate_video = Some(clip.clone());
                             } else {
-                                DragMode::Move {
-                                    start_frame_start: clip.start_frame,
-                                }
-                            };
-                            self.drag = Some(DragState {
-                                target: DragTarget::Video,
-                                clip_idx: i,
-                                pointer_start_x: pos.x,
-                                mode,
-                            });
+                                clicked_video = Some(i);
+                                self.drag = Some(DragState {
+                                    target: DragTarget::Video,
+                                    clip_idx: i,
+                                    pointer_start_x: pos.x,
+                                    mode: DragMode::Move {
+                                        start_frame_start: clip.start_frame,
+                                    },
+                                });
+                            }
                             break;
                         }
+                    }
+                    if let Some(mut new_clip) = duplicate_video {
+                        let start_frame = new_clip.start_frame;
+                        new_clip.id = self.next_id();
+                        new_clip.selected = false;
+                        let new_idx = self.clips.len();
+                        self.clips.push(new_clip);
+                        clicked_video = Some(new_idx);
+                        self.drag = Some(DragState {
+                            target: DragTarget::Video,
+                            clip_idx: new_idx,
+                            pointer_start_x: pos.x,
+                            mode: DragMode::Move { start_frame_start: start_frame },
+                        });
                     }
                     if clicked_video.is_none() {
                         clicked_background = true;
                         self.playhead = self.x_to_frame(rect.left(), pos.x).max(0);
                     }
                 } else if audio_rect.contains(pos) {
+                    let mut duplicate_audio: Option<AudioTimelineClip> = None;
                     for (i, clip) in self.audio_clips.iter().enumerate().rev() {
                         let cl = self.frame_to_x(rect.left(), clip.start_frame);
                         let cr = self.frame_to_x(rect.left(), clip.end_frame());
                         if pos.x >= cl && pos.x <= cr {
-                            clicked_audio = Some(i);
                             let edge_w = HANDLE_W.min((cr - cl) / 3.0);
-                            let mode = if shift {
+                            if shift {
                                 // Shift+drag: left half = fade in (drag right), right half = fade out (drag left)
-                                if pos.x < (cl + cr) / 2.0 {
+                                let mode = if pos.x < (cl + cr) / 2.0 {
                                     DragMode::FadeIn {
                                         fade_in_start: clip.fade_in_frames,
                                     }
@@ -488,30 +517,64 @@ impl TimelinePanel {
                                     DragMode::FadeOut {
                                         fade_out_start: clip.fade_out_frames,
                                     }
-                                }
+                                };
+                                clicked_audio = Some(i);
+                                self.drag = Some(DragState {
+                                    target: DragTarget::Audio,
+                                    clip_idx: i,
+                                    pointer_start_x: pos.x,
+                                    mode,
+                                });
                             } else if pos.x < cl + edge_w {
-                                DragMode::TrimIn {
-                                    start_frame_start: clip.start_frame,
-                                    source_offset_start: clip.source_offset,
-                                    frame_count_start: clip.frame_count,
-                                }
+                                clicked_audio = Some(i);
+                                self.drag = Some(DragState {
+                                    target: DragTarget::Audio,
+                                    clip_idx: i,
+                                    pointer_start_x: pos.x,
+                                    mode: DragMode::TrimIn {
+                                        start_frame_start: clip.start_frame,
+                                        source_offset_start: clip.source_offset,
+                                        frame_count_start: clip.frame_count,
+                                    },
+                                });
                             } else if pos.x > cr - edge_w {
-                                DragMode::TrimOut {
-                                    frame_count_start: clip.frame_count,
-                                }
+                                clicked_audio = Some(i);
+                                self.drag = Some(DragState {
+                                    target: DragTarget::Audio,
+                                    clip_idx: i,
+                                    pointer_start_x: pos.x,
+                                    mode: DragMode::TrimOut {
+                                        frame_count_start: clip.frame_count,
+                                    },
+                                });
+                            } else if alt {
+                                duplicate_audio = Some(clip.clone());
                             } else {
-                                DragMode::Move {
-                                    start_frame_start: clip.start_frame,
-                                }
-                            };
-                            self.drag = Some(DragState {
-                                target: DragTarget::Audio,
-                                clip_idx: i,
-                                pointer_start_x: pos.x,
-                                mode,
-                            });
+                                clicked_audio = Some(i);
+                                self.drag = Some(DragState {
+                                    target: DragTarget::Audio,
+                                    clip_idx: i,
+                                    pointer_start_x: pos.x,
+                                    mode: DragMode::Move {
+                                        start_frame_start: clip.start_frame,
+                                    },
+                                });
+                            }
                             break;
                         }
+                    }
+                    if let Some(mut new_clip) = duplicate_audio {
+                        let start_frame = new_clip.start_frame;
+                        new_clip.selected = false;
+                        let new_idx = self.audio_clips.len();
+                        self.audio_clips.push(new_clip);
+                        clicked_audio = Some(new_idx);
+                        self.drag = Some(DragState {
+                            target: DragTarget::Audio,
+                            clip_idx: new_idx,
+                            pointer_start_x: pos.x,
+                            mode: DragMode::Move { start_frame_start: start_frame },
+                        });
                     }
                     if clicked_audio.is_none() {
                         clicked_background = true;
