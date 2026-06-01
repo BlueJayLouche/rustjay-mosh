@@ -1,6 +1,6 @@
 [package]
 name = "rustjay-mosh"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Rust-based NLE focused on datamoshing via I-frame removal and motion-vector manipulation"
 license = "MIT"
