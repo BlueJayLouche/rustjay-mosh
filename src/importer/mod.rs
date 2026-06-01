@@ -20,8 +20,8 @@ pub enum ImportError {
 }
 
 /// Fixed project resolution. All clips are normalized to this size on import.
-const PROJECT_WIDTH: u32 = 1280;
-const PROJECT_HEIGHT: u32 = 720;
+const PROJECT_WIDTH: u32 = 1920;
+const PROJECT_HEIGHT: u32 = 1080;
 
 /// Transcode the source video to a long-GOP H.264 file, read its packets,
 /// and return a `PacketClip` plus the first decoded YUV frame.
@@ -104,6 +104,56 @@ pub fn import_video(path: &Path, name: impl Into<String>) -> Result<(PacketClip,
     };
 
     Ok((clip, yuv))
+}
+
+/// Read an already-normalized long-GOP MP4 back into a `PacketClip` without
+/// re-transcoding. Used when loading a saved project bundle, whose `media/*.mp4`
+/// files were written by [`crate::render::muxer::export_packets`] and are
+/// therefore already in the project's I+P packet layout.
+pub fn read_clip_from_mp4(
+    path: &Path,
+    name: impl Into<String>,
+    id: u64,
+) -> Result<PacketClip, ImportError> {
+    ffmpeg::init()?;
+
+    let mut ictx = ffmpeg::format::input(&path)?;
+    let stream = ictx
+        .streams()
+        .best(ffmpeg::media::Type::Video)
+        .ok_or(ImportError::NoVideoStream)?;
+    let stream_idx = stream.index();
+    let time_base = stream.time_base();
+    let codec_parameters = stream.parameters();
+    // All project media is normalized to the project resolution on import.
+    let width = PROJECT_WIDTH;
+    let height = PROJECT_HEIGHT;
+
+    let mut packets: Vec<OwnedPacket> = Vec::new();
+    for (s, packet) in ictx.packets() {
+        if s.index() != stream_idx {
+            continue;
+        }
+        let data = packet.data().unwrap_or(&[]).to_vec();
+        let is_key = packet.flags().contains(ffmpeg::codec::packet::Flags::KEY);
+        packets.push(OwnedPacket {
+            data,
+            pts: packet.pts().unwrap_or(0),
+            dts: packet.dts().unwrap_or(0),
+            duration: packet.duration(),
+            is_key,
+        });
+    }
+
+    Ok(PacketClip {
+        id,
+        name: name.into(),
+        packets,
+        width,
+        height,
+        codec_parameters,
+        time_base,
+    })
 }
 
 fn copy_yuv_from_frame(frame: &ffmpeg::util::frame::video::Video) -> Yuv420 {

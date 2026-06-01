@@ -61,6 +61,8 @@ Needs: Rust 1.85+, FFmpeg 8.x, GPU with Metal/Vulkan/DX12 support.
 | `preview::decoder` | 100 | `PacketDecoder` — flush + decode from nearest keyframe up to target frame |
 | `render::muxer` | 60 | `export_packets` — remux `Vec<OwnedPacket>` to MP4 without re-encoding |
 | `packet::mod` | 85 | `OwnedPacket`, `PacketClip`, `ClipSpan`, `build_sequence` |
+| `project::mod` | 480 | Project bundles: `save_bundle`/`load_bundle`, `collect_zip`, recent-projects + autosave paths, serde manifest DTOs |
+| `render::delivery` | 380 | `ExportPreset` platform delivery-encode presets (see "Delivery presets") |
 | `codec::ir` | 35 | `Yuv420` struct |
 | `datamosh::mod` | 40 | `remove_iframes`, `cross_clip_mosh` (legacy graph ops) |
 | `frame_graph::mod` | 75 | DAG of frame references (legacy, kept for reference) |
@@ -70,7 +72,7 @@ Needs: Rust 1.85+, FFmpeg 8.x, GPU with Metal/Vulkan/DX12 support.
 
 ### Import (video)
 1. User picks a file → `MoshApp::start_import` spawns thread
-2. `importer::import_video` runs ffmpeg CLI: `ffmpeg -i input -vf scale=1280:720 -vcodec libx264 -g 99999999 -bf 0 -pix_fmt yuv420p temp.mp4`
+2. `importer::import_video` runs ffmpeg CLI: `ffmpeg -i input -vf scale=1920:1080 -vcodec libx264 -g 99999999 -bf 0 -pix_fmt yuv420p temp.mp4` (project resolution is 1920×1080; `PROJECT_WIDTH`/`PROJECT_HEIGHT` in `importer/mod.rs`)
 3. Reads packets from temp MP4 into `Vec<OwnedPacket>`
 4. Decodes first packet to get a `Yuv420` preview frame
 5. Stores `PacketClip { packets, codec_parameters, time_base, ... }` in `MoshApp::packet_clips`
@@ -96,11 +98,31 @@ Needs: Rust 1.85+, FFmpeg 8.x, GPU with Metal/Vulkan/DX12 support.
 ### Render
 1. Build `Vec<OwnedPacket>` from timeline clips in sorted order
 2. Per clip: rebase PTS/DTS to be monotonic across the whole sequence (`pts_offset` accumulator)
-3. If audio clips exist:
-   - `export_packets()` → temp `video.mp4`
-   - `audio::render_audio_mix()` → temp `audio.wav` (48kHz stereo f32)
-   - ffmpeg CLI mux: `ffmpeg -y -i video.mp4 -i audio.wav -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k output.mp4`
-4. If no audio: `export_packets()` directly to output path
+3. `export_packets()` → temp `video.mp4` (direct remux, preserves the moshed long-GOP)
+4. If audio clips exist: `audio::render_audio_mix()` → temp `audio.wav` (48kHz stereo f32)
+5. **Delivery pass** — `ExportPreset::build_ffmpeg_args()` (in `render/delivery.rs`)
+   produces the final ffmpeg CLI args from the user-selected export preset
+   (`MoshApp::export_preset`), muxing in `audio.wav` if present, then writing
+   the output. The default `RawMosh` preset is `-c:v copy` (historical
+   behaviour); all other presets **re-encode** to a clean, platform-shaped
+   H.264 master (see "Delivery presets" below).
+
+### Delivery presets (`render/delivery.rs`)
+`export_packets`' direct remux hands the platform a fragile 1-keyframe long-GOP
+bitstream; platforms re-compress it badly → blockiness. The mosh glitch lives in
+the decoded **pixels**, so the delivery presets re-encode to a high-quality
+(CRF 16–17, closed 2 s GOP, `+faststart`, `yuv420p`) platform-shaped master that
+preserves the glitch but compresses gracefully.
+
+- Layouts translate the user's `glitchFuck_insta*.sh` scripts: `ReelsBlur`
+  (blurred-bg fill), `ReelsCrop`, `ReelsTriptych` (all 1080×1920), `FeedSquare`
+  (1080×1080), `FeedLandscape` (1080×608).
+- YouTube: `YouTube1080` (native 1920×1080, generous bitrate + `aq-mode=3`) and
+  `YouTube4K` (lanczos upscale to 3840×2160 — escapes YouTube's 1080p
+  compression tier into the VP9/AV1 high-bitrate tier).
+- `FilterSpec::Simple` → `-vf` (video stays on `0:v`); `FilterSpec::Complex`
+  (blur/triptych are multi-node graphs) → `-filter_complex` producing `[vout]`,
+  mapped explicitly alongside `1:a:0`. Arg-builder logic is unit-tested.
 
 ## Critical gotchas / recent bugfixes
 
@@ -121,6 +143,36 @@ Normal drag on audio clip edge = **trim** (same as video). Hold **Shift** + drag
 ### Packet iterator bug (fixed)
 `ClipSpan::iter_packets()` was skipping the leading keyframe but not adjusting visible count, causing a 1-frame gap in renders. Fixed by shrinking `visible_count` when `drop_leading_keyframe` is true.
 
+### Project bundles (`project/mod.rs`)
+A project saves as a **self-contained bundle directory** (`*.rjmosh`) because
+baked clips are synthesised in-app and have no source file to relink to:
+
+```
+my_project.rjmosh/
+  project.json            manifest (serde DTOs: timeline edits, fps, export preset, zoom, playhead)
+  media/clip_<i>.mp4       one per PacketClip — written by export_packets (remux, no re-encode)
+  audio/audio_<i>.wav      one per AudioClip (32-bit float)
+```
+
+- `load_bundle` reconstructs each `PacketClip` via `importer::read_clip_from_mp4`
+  (no re-transcode) and each `AudioClip` via `audio::read_audio_clip_from_wav`
+  (peaks recomputed for the project fps).
+- The manifest never serialises ffmpeg types (`Parameters`/`Rational`) — those
+  come back from reading the media files. DTOs also drop transient editor state
+  (`selected`).
+- **Collect files to share** (`collect_zip`) saves a fresh bundle into a temp dir
+  then zips it, so it works even on an unsaved project.
+- **Export for all platforms** (`MoshApp::start_export_all`) remuxes the moshed
+  video once, mixes audio once, then runs each `ExportPreset::ALL_PLATFORMS` preset.
+- **Autosave**: `MoshApp::maybe_autosave` writes a recovery bundle to
+  `<config>/rustjay-mosh/autosave/recovery.rjmosh` every 120 s while dirty and
+  idle; on startup a found snapshot is offered via a recovery banner. A clean
+  save deletes it.
+- **Undo/redo** is snapshot-based: `commit_edit_if_changed()` (end of every
+  frame, skipped mid-drag) pushes the previous `EditSnapshot { clips, audio_clips }`
+  when the timeline changed. Heavy media is never snapshotted. Ctrl+Z / Ctrl+Shift+Z.
+- **Recent projects** live in `<config>/rustjay-mosh/recent.json` (capped 10).
+
 ## Code conventions
 
 - **No custom `AGENTS.md` in subdirs** — root `AGENTS.md` is the source of truth
@@ -135,6 +187,9 @@ Normal drag on audio clip edge = **trim** (same as video). Hold **Shift** + drag
 | Add a new mosh operation | `datamosh/mod.rs`, `ui/app.rs` right-panel buttons |
 | Change timeline drag behavior | `ui/timeline_panel.rs` — `DragMode`, hit-test, drag logic |
 | Add new render format | `render/muxer.rs`, `start_render()` in `ui/app.rs` |
+| Add/adjust a delivery (export) preset | `render/delivery.rs` — `ExportPreset` enum + `filter()` / `video_codec_args()` |
+| Change the project save format | `project/mod.rs` — bump `FORMAT_VERSION`, update manifest DTOs |
+| Add an undoable edit | nothing special — `commit_edit_if_changed()` snapshots timeline state at end of every frame the clips change |
 | Change preview quality | `importer/mod.rs` transcode settings (CRF, preset) |
 | Add audio effects | `audio/mod.rs` — `render_audio_mix()` is the mixing loop |
 | Change zoom limits | `ui/timeline_panel.rs` — `clamp(0.5, 500.0)` |

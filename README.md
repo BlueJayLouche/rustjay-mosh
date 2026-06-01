@@ -38,10 +38,14 @@ The result is the iconic "melting" or "smearing" glitch aesthetic found in music
 - **Non-blocking preview** — playhead scrubbing and ruler selection update instantly; preview frames decode in a background thread so the UI never stalls
 - **Cross-clip mosh** — one click drops the leading keyframe of the selected clip so it bleeds into the preceding clip
 - **Glitch effects (Bake)** — decode → manipulate pixels → re-encode. Includes data bending (reverse scanlines, echo, bitcrush, byte swap, XOR, noise) and JPEG compression artifacting on arbitrary regions.
-- **Audio tracks** — import audio (or extract from video), place on timeline, trim, fade in/out, crossfade. Renders to AAC 192 kbps.
+- **Audio tracks** — import audio (or extract from video), place on timeline, trim, fade in/out, crossfade. Renders to AAC (256 kbps, or 384 kbps for YouTube presets).
 - **Multi-track video** — stack clips on two video tracks (0 = top, 1 = bottom)
 - **wgpu preview** — GPU-accelerated YUV→RGB display via a WGSL BT.601 shader; no CPU colour conversion
 - **Render to MP4** — remuxes the manipulated packet stream directly to H.264 MP4 without re-encoding, with mixed audio
+- **Delivery presets** — optionally re-encode the moshed output into a clean, platform-shaped master for Instagram (Reels 9:16 with blurred-bg / crop / triptych layouts, Feed 1:1 / 16:9) and YouTube (1080p, or a 4K upscale that escapes YouTube's blocky 1080p compression tier). The glitch lives in the pixels, so it survives the re-encode — but the platform now compresses from a pristine high-quality source instead of mangling the fragile mosh bitstream.
+- **Save / share projects** — save to a self-contained `.rjmosh` bundle (embeds every clip + audio, so baked glitch clips survive a round-trip), with recent-projects, autosave crash-recovery, and a one-click **Collect files to share** that zips the whole bundle.
+- **Export for all platforms** — render the timeline through every platform preset (Reels, Feed, YouTube 1080p, YouTube 4K) into a folder in one action.
+- **Undo / redo** — full timeline edit history (Ctrl+Z / Ctrl+Shift+Z).
 
 ---
 
@@ -105,8 +109,21 @@ cargo run --release
    Trim the edges of an audio clip to snap them to video clip boundaries.  
    Hold **Shift** and drag the **left half** of an audio clip rightward to adjust fade in; hold **Shift** and drag the **right half** leftward to adjust fade out. Crossfades are automatic when adjacent clips have overlapping fade regions.
 
-7. **Render** — set the output FPS, click **🎬 Render to file…**, choose an output path.  
-   The packet sequence is rewritten with monotonic timestamps and remuxed to MP4. If audio clips exist, a 48 kHz stereo mix is rendered and muxed to AAC.
+7. **Render** — set the output FPS, pick an **export preset**, click **🎬 Render to file…**, choose an output path.  
+   The packet sequence is rewritten with monotonic timestamps and remuxed to MP4. If audio clips exist, a 48 kHz stereo mix is rendered and muxed to AAC.  
+   The default **Raw mosh** preset copies the video stream untouched. The Instagram/YouTube presets re-encode to a clean, platform-shaped H.264 master (closed 2 s GOP, `+faststart`, generous bitrate) so platforms compress from a pristine source — the fix for cross-platform blockiness. **Tip:** for YouTube, the **4K (anti-compression)** preset upscales to 2160p so YouTube encodes the upload in its high-bitrate VP9/AV1 tier, which looks dramatically cleaner even at 1080p playback.
+
+8. **Save / share** — use the **📁 Project** menu to *Save* (Ctrl+S) / *Open* (Ctrl+O) a self-contained `.rjmosh` bundle, reopen a *Recent project*, *Collect files to share* as a single `.zip`, or *Export for all platforms* (renders every preset into a folder at once). Work is autosaved periodically; if the app crashes, a recovery banner offers to restore on next launch.
+
+### Project & editing shortcuts
+
+| Action | Shortcut |
+|---|---|
+| Save project | Ctrl+S |
+| Open project | Ctrl+O |
+| Undo | Ctrl+Z |
+| Redo | Ctrl+Shift+Z |
+| Delete selected clips | Delete |
 
 ### Timeline controls
 
@@ -157,6 +174,8 @@ cargo run --release
 | `packet` | `OwnedPacket`, `PacketClip`, `ClipSpan`, `build_sequence` |
 | `preview::decoder` | `PacketDecoder` — flush + sequential decode up to any frame |
 | `render::muxer` | `export_packets` — remux packet slice to MP4 without re-encoding |
+| `render::delivery` | `ExportPreset` — platform delivery-encode presets (Instagram/YouTube) |
+| `project` | `.rjmosh` bundle save/load, collect-to-zip, recent projects, autosave |
 | `importer` | FFmpeg transcode + packet extraction |
 | `audio` | `AudioClip`, `AudioTimelineClip`, `import_audio`, `render_audio_mix` |
 | `bake` | `bake_segment` — decode, apply effects (bend/compress), re-encode to H.264 |
