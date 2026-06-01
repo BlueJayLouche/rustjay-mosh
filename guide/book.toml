@@ -1,0 +1,16 @@
+[book]
+title = "rustjay-mosh Guide"
+authors = ["BlueJayLouche"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+site-url = "/rustjay-mosh/"
+git-repository-url = "https://github.com/BlueJayLouche/rustjay-mosh"
+additional-css = ["theme/custom.css"]
+
+[output.html.fold]
+enable = true
+level = 1
