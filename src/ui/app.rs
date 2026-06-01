@@ -145,6 +145,11 @@ pub struct MoshApp {
     proj_msg_tx: mpsc::Sender<ProjectMsg>,
     proj_busy: bool,
     last_autosave: Instant,
+    /// Set when "New Project" needs to confirm discarding unsaved changes.
+    show_new_confirm: bool,
+    /// Set when a save was requested via the confirm's "Save first…" — start a
+    /// new project once that save succeeds.
+    new_after_save: bool,
 
     // ── Undo / redo ───────────────────────────────────────────────────────
     undo_stack: Vec<EditSnapshot>,
@@ -233,6 +238,8 @@ impl MoshApp {
             proj_msg_tx,
             proj_busy: false,
             last_autosave: Instant::now(),
+            show_new_confirm: false,
+            new_after_save: false,
 
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -320,8 +327,16 @@ impl MoshApp {
                 }
                 self.recovery_available = None;
                 self.status = format!("Saved project → {}", dir.display());
+                // If this save was requested to clear the way for a new project,
+                // start it now that the work is safely on disk.
+                if self.new_after_save {
+                    self.new_project();
+                }
             }
-            Err(e) => self.status = format!("Save failed: {e}"),
+            Err(e) => {
+                self.new_after_save = false;
+                self.status = format!("Save failed: {e}");
+            }
         }
     }
 
@@ -332,6 +347,55 @@ impl MoshApp {
         } else {
             self.prompt_save_as(ctx);
         }
+    }
+
+    /// True when the project holds work that would be lost by starting over.
+    fn has_unsaved_work(&self) -> bool {
+        self.project_dirty
+            && !(self.packet_clips.is_empty()
+                && self.audio_clips.is_empty()
+                && self.timeline.clips.is_empty()
+                && self.timeline.audio_clips.is_empty())
+    }
+
+    /// Start a new project — confirm first if there are unsaved changes.
+    fn request_new_project(&mut self) {
+        if self.has_unsaved_work() {
+            self.show_new_confirm = true;
+        } else {
+            self.new_project();
+        }
+    }
+
+    /// Reset all editor state to an empty project.
+    fn new_project(&mut self) {
+        self.show_new_confirm = false;
+        self.new_after_save = false;
+        self.packet_clips.clear();
+        self.audio_clips.clear();
+        self.timeline.clips.clear();
+        self.timeline.audio_clips.clear();
+        self.timeline.clear_selection();
+        self.timeline.set_next_id(0);
+        self.timeline.playhead = 0;
+        self.timeline.zoom = 4.0;
+
+        self.clip_uid = 0;
+        self.color_idx = 0;
+        self.render_fps = 30;
+        self.export_preset = ExportPreset::RawMosh;
+
+        // Tear down the preview worker so the next import seeds a fresh one.
+        self.preview_req_tx = None;
+        self.preview_cache = None;
+
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_snapshot = self.snapshot();
+
+        self.project_path = None;
+        self.project_dirty = false;
+        self.status = "New project.".into();
     }
 
     fn prompt_save_as(&self, ctx: &egui::Context) {
@@ -857,6 +921,39 @@ impl MoshApp {
     }
 
     // ── Glitch dialogs ────────────────────────────────────────────────────────
+
+    /// Confirmation modal for "New Project" when there are unsaved changes.
+    fn draw_new_confirm(&mut self, ctx: &egui::Context) {
+        if !self.show_new_confirm {
+            return;
+        }
+        egui::Window::new("New Project")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Discard the current project and start a new one?");
+                ui.label(
+                    egui::RichText::new("Unsaved changes will be lost.")
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Discard & start new").clicked() {
+                        self.new_project();
+                    }
+                    if ui.button("Save first…").clicked() {
+                        self.show_new_confirm = false;
+                        self.new_after_save = true;
+                        self.save_or_prompt(ctx);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.show_new_confirm = false;
+                    }
+                });
+            });
+    }
 
     fn draw_bend_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_bend_dialog {
@@ -1626,11 +1723,12 @@ impl eframe::App for MoshApp {
         // ── Keyboard shortcuts ────────────────────────────────────────────────
         // Collect intents inside the input closure, then act (acting needs `ctx`,
         // which `ctx.input` has borrowed).
-        let (do_delete, do_save, do_open, do_undo, do_redo) = ctx.input(|i| {
+        let (do_delete, do_new, do_save, do_open, do_undo, do_redo) = ctx.input(|i| {
             let cmd = i.modifiers.command;
             let z = i.key_pressed(egui::Key::Z);
             (
                 i.key_pressed(egui::Key::Delete),
+                cmd && i.key_pressed(egui::Key::N),
                 cmd && i.key_pressed(egui::Key::S),
                 cmd && i.key_pressed(egui::Key::O),
                 cmd && z && !i.modifiers.shift,
@@ -1639,6 +1737,9 @@ impl eframe::App for MoshApp {
         });
         if do_delete {
             self.remove_selected_clips();
+        }
+        if do_new {
+            self.request_new_project();
         }
         if do_undo {
             self.undo();
@@ -1657,6 +1758,11 @@ impl eframe::App for MoshApp {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.menu_button("📁 Project", |ui| {
+                    if ui.button("New         Ctrl+N").clicked() {
+                        self.request_new_project();
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("Save        Ctrl+S").clicked() {
                         self.save_or_prompt(ctx);
                         ui.close_menu();
@@ -1998,6 +2104,7 @@ impl eframe::App for MoshApp {
         // ── Glitch dialogs ────────────────────────────────────────────────────
         self.draw_bend_dialog(ctx);
         self.draw_compress_dialog(ctx);
+        self.draw_new_confirm(ctx);
 
         // End-of-frame bookkeeping: capture an undo point if the timeline
         // changed this frame, then run the autosave heartbeat.

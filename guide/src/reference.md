@@ -4,6 +4,7 @@
 
 | Shortcut | Action |
 |---|---|
+| `Ctrl+N` | New project (confirms if there are unsaved changes) |
 | `Ctrl+S` | Save project (prompts for a location the first time) |
 | `Ctrl+O` | Open a `.rjmosh` project |
 | `Ctrl+Z` | Undo |

@@ -113,12 +113,13 @@ cargo run --release
    The packet sequence is rewritten with monotonic timestamps and remuxed to MP4. If audio clips exist, a 48 kHz stereo mix is rendered and muxed to AAC.  
    The default **Raw mosh** preset copies the video stream untouched. The Instagram/YouTube presets re-encode to a clean, platform-shaped H.264 master (closed 2 s GOP, `+faststart`, generous bitrate) so platforms compress from a pristine source — the fix for cross-platform blockiness. **Tip:** for YouTube, the **4K (anti-compression)** preset upscales to 2160p so YouTube encodes the upload in its high-bitrate VP9/AV1 tier, which looks dramatically cleaner even at 1080p playback.
 
-8. **Save / share** — use the **📁 Project** menu to *Save* (Ctrl+S) / *Open* (Ctrl+O) a self-contained `.rjmosh` bundle, reopen a *Recent project*, *Collect files to share* as a single `.zip`, or *Export for all platforms* (renders every preset into a folder at once). Work is autosaved periodically; if the app crashes, a recovery banner offers to restore on next launch.
+8. **Save / share** — use the **📁 Project** menu to start a *New* project (Ctrl+N), *Save* (Ctrl+S) / *Open* (Ctrl+O) a self-contained `.rjmosh` bundle, reopen a *Recent project*, *Collect files to share* as a single `.zip`, or *Export for all platforms* (renders every preset into a folder at once). Work is autosaved periodically; if the app crashes, a recovery banner offers to restore on next launch.
 
 ### Project & editing shortcuts
 
 | Action | Shortcut |
 |---|---|
+| New project | Ctrl+N |
 | Save project | Ctrl+S |
 | Open project | Ctrl+O |
 | Undo | Ctrl+Z |

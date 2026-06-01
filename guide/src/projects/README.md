@@ -19,12 +19,13 @@ The bundle **embeds all the media**. There's a concrete reason for that: [baked 
 
 | Action | Where | Shortcut |
 |---|---|---|
+| New | 📁 Project → New | `Ctrl+N` |
 | Save | 📁 Project → Save | `Ctrl+S` |
 | Save As | 📁 Project → Save As… | |
 | Open | 📁 Project → Open… | `Ctrl+O` |
 | Recent | 📁 Project → Recent projects | |
 
-The top bar shows the project name with a `*` while there are unsaved changes. **Open** points at a `.rjmosh` folder; the app reads the manifest, loads every embedded clip back into the pool, rebuilds the timeline, and restores your FPS, zoom, playhead, and export-preset choice.
+**New** clears the editor back to an empty project (and asks first if you have unsaved changes — you can discard, save first, or cancel). The top bar shows the project name with a `*` while there are unsaved changes. **Open** points at a `.rjmosh` folder; the app reads the manifest, loads every embedded clip back into the pool, rebuilds the timeline, and restores your FPS, zoom, playhead, and export-preset choice.
 
 > The most-recently-used projects (up to 10) are remembered between sessions and listed under **Recent projects**.
 
