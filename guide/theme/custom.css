@@ -35,6 +35,10 @@ html.ayu {
     --rj-alert:      oklch(0.70 0.20 25);
     --rj-cool:       oklch(0.80 0.10 215);
 
+    /* ── Datamosh glitch accent (magenta / green RGB-split pair) ── */
+    --rj-glitch-m:   oklch(0.70 0.27 332);   /* hot magenta */
+    --rj-glitch-g:   oklch(0.86 0.26 150);   /* hot green   */
+
     /* Legacy aliases — old class names keep working */
     --rj-accent:     var(--rj-amber);
     --rj-accent2:    var(--rj-cool);
@@ -106,6 +110,11 @@ body::after {
         0deg, rgba(255,255,255,0.012) 0 1px, transparent 1px 3px);
     mix-blend-mode: overlay;
     z-index: 9999;
+    /* slow continuous downward scan roll (loops seamlessly over the 3px period) */
+    animation: rj-scan-roll 7s linear infinite;
+}
+@keyframes rj-scan-roll {
+    to { background-position: 0 3px; }
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -617,8 +626,143 @@ mark { background: var(--rj-amber); color: #0a0a0a; }
     background: rgba(232,160,74,0.04);
 }
 
-/* Print: drop the scanline + grid overlays */
+/* ═════════════════════════════════════════════════════════════════════════
+   GLITCH PASS — datamosh accent (magenta / green), subtle + hover-driven
+   Appended on top of the HUD theme. Pure CSS; drops in via additional-css.
+   Body copy and headings stay clean — glitch lives on the hero logo, the
+   background field, and sidebar hover states only.
+   ═════════════════════════════════════════════════════════════════════════ */
+
+/* ── Background: rare datamosh "smear" sweep ──────────────────────────────
+   A faint magenta→green band that tears down the page now and then, screen-
+   blended over the grid. Mostly invisible; fires ~once per cycle.            */
+html::after {
+    content: "";
+    position: fixed;
+    left: 0; right: 0;
+    top: 0;
+    height: 16vh;
+    pointer-events: none;
+    z-index: 9998;
+    background: linear-gradient(
+        180deg,
+        transparent 0%,
+        color-mix(in oklch, var(--rj-glitch-m) 28%, transparent) 38%,
+        color-mix(in oklch, var(--rj-glitch-g) 24%, transparent) 62%,
+        transparent 100%);
+    mix-blend-mode: screen;
+    opacity: 0;
+    will-change: transform, opacity;
+    transform: translateY(-20vh);
+    animation: rj-mosh-sweep 13s ease-in-out infinite;
+}
+@keyframes rj-mosh-sweep {
+    0%, 68%   { opacity: 0; transform: translateY(-20vh) scaleY(1); }
+    70%       { opacity: 0.9; transform: translateY(-10vh) scaleY(0.6); }
+    73%       { opacity: 0.7; transform: translateY(30vh)  scaleY(2.4); }   /* the tear */
+    76%       { opacity: 0.85; transform: translateY(62vh) scaleY(0.5); }
+    82%       { opacity: 0; transform: translateY(120vh) scaleY(1); }
+    100%      { opacity: 0; transform: translateY(120vh) scaleY(1); }
+}
+
+/* ── Hero logo: idle chromatic edge + occasional flicker ──────────────────
+   Always carries a hairline RGB split; jitters briefly a couple of times a
+   cycle. On hover it breaks into a faster, harder datamosh.                  */
+.rj-logo {
+    position: relative;
+    text-shadow:
+        -0.6px 0 0 color-mix(in oklch, var(--rj-glitch-m) 60%, transparent),
+         0.6px 0 0 color-mix(in oklch, var(--rj-glitch-g) 50%, transparent);
+    animation: rj-logo-idle 8s steps(1, end) infinite;
+    will-change: transform, text-shadow;
+}
+@keyframes rj-logo-idle {
+    0%, 40%, 100% {
+        transform: translateX(0);
+        text-shadow:
+            -0.6px 0 0 color-mix(in oklch, var(--rj-glitch-m) 60%, transparent),
+             0.6px 0 0 color-mix(in oklch, var(--rj-glitch-g) 50%, transparent);
+    }
+    41% { transform: translateX(1.5px) skewX(-1deg);
+          text-shadow: -3px 0 0 var(--rj-glitch-m), 3px 0 0 var(--rj-glitch-g); }
+    42% { transform: translateX(-1.5px);
+          text-shadow: 2px 0 0 var(--rj-glitch-m), -2px 0 0 var(--rj-glitch-g); }
+    43% { transform: translateX(0); }
+    78% { transform: translateX(-1px) skewX(0.6deg);
+          text-shadow: -2px 0 0 var(--rj-glitch-g), 2px 0 0 var(--rj-glitch-m); }
+    79% { transform: translateX(0); }
+}
+.rj-logo:hover {
+    animation: rj-logo-glitch 0.6s steps(2, end) infinite;
+    cursor: default;
+}
+@keyframes rj-logo-glitch {
+    0%   { transform: translate(0,0) skewX(0);
+           text-shadow: -2px 0 0 var(--rj-glitch-m), 2px 0 0 var(--rj-glitch-g);
+           clip-path: inset(0 0 0 0); }
+    25%  { transform: translate(2px,-1px) skewX(-3deg);
+           text-shadow: -4px 0 0 var(--rj-glitch-m), 3px 1px 0 var(--rj-glitch-g);
+           clip-path: inset(12% 0 48% 0); }
+    50%  { transform: translate(-2px,1px) skewX(2deg);
+           text-shadow: 3px 0 0 var(--rj-glitch-m), -4px 0 0 var(--rj-glitch-g);
+           clip-path: inset(40% 0 18% 0); }
+    75%  { transform: translate(1px,0) skewX(-1deg);
+           text-shadow: -3px 1px 0 var(--rj-glitch-g), 3px -1px 0 var(--rj-glitch-m);
+           clip-path: inset(60% 0 8% 0); }
+    100% { transform: translate(0,0) skewX(0);
+           text-shadow: -2px 0 0 var(--rj-glitch-m), 2px 0 0 var(--rj-glitch-g);
+           clip-path: inset(0 0 0 0); }
+}
+/* the "/" pip blinks between amber and datamosh magenta */
+.rj-logo-accent {
+    animation: rj-pip-blink 4.5s steps(1, end) infinite;
+}
+@keyframes rj-pip-blink {
+    0%, 88%, 100% { color: var(--rj-amber); }
+    90%, 96%      { color: var(--rj-glitch-m); }
+    93%           { color: var(--rj-glitch-g); }
+}
+
+/* ── Sidebar links: glitch on hover ───────────────────────────────────────
+   Snappy one-shot RGB-split + tear when the pointer lands on a chapter link. */
+.sidebar .chapter li a { position: relative; }
+.sidebar .chapter li a:hover {
+    text-shadow: -1px 0 0 var(--rj-glitch-m), 1px 0 0 var(--rj-glitch-g);
+    animation: rj-link-glitch 0.32s steps(2, end) 1;
+}
+@keyframes rj-link-glitch {
+    0%   { transform: translateX(0); clip-path: inset(0 0 0 0); }
+    30%  { transform: translateX(-2px) skewX(-4deg); clip-path: inset(0 0 55% 0); }
+    55%  { transform: translateX(2px);  clip-path: inset(45% 0 0 0); }
+    80%  { transform: translateX(-1px) skewX(2deg); clip-path: inset(20% 0 30% 0); }
+    100% { transform: translateX(0); clip-path: inset(0 0 0 0); }
+}
+/* active marker bar flickers to magenta when its row is hovered */
+.sidebar .chapter li a.active:hover::before {
+    animation: rj-bar-flicker 0.32s steps(2, end) 1;
+}
+@keyframes rj-bar-flicker {
+    0%, 100% { background: var(--rj-amber); }
+    40%      { background: var(--rj-glitch-m); }
+    70%      { background: var(--rj-glitch-g); }
+}
+
+/* ── Respect reduced-motion: keep the look, drop the movement ─────────────── */
+@media (prefers-reduced-motion: reduce) {
+    body::after,
+    html::after,
+    .rj-logo,
+    .rj-logo-accent,
+    .rj-hero-meta .rj-status::before { animation: none !important; }
+    .rj-logo:hover,
+    .sidebar .chapter li a:hover { animation: none !important; }
+    html::after { opacity: 0 !important; }
+}
+
+/* Print: drop the scanline, smear, grid + glitch overlays */
 @media print {
-    body::after { display: none; }
+    body::after,
+    html::after { display: none !important; }
     body.navy { background-image: none !important; }
+    .rj-logo { animation: none !important; text-shadow: none !important; }
 }
