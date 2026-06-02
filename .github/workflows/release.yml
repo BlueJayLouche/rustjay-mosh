@@ -74,7 +74,7 @@ jobs:
             -Headers @{ Authorization = "token $env:GH_TOKEN"; "User-Agent" = "gh-actions" }
           $asset = $null
           foreach ($r in $releases) {
-            $found = $r.assets | Where-Object { $_.name -match "ffmpeg-n7\.1-latest-win64-lgpl-shared.*\.zip" }
+            $found = $r.assets | Where-Object { $_.name -match "ffmpeg-n7\.1-latest-win64-gpl-shared.*\.zip" }
             if ($found) { $asset = $found[0]; break }
           }
           if (-not $asset) { throw "Could not find FFmpeg n7.1 build in recent releases" }
