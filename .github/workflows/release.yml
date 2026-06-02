@@ -43,8 +43,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ matrix.target }}-cargo-
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('.github/workflows/release.yml') }}
+          restore-keys: |
+            ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ matrix.target }}-cargo-
 
       # ── Linux ──────────────────────────────────────────────────────────────
       - name: Install FFmpeg (Linux)
@@ -86,6 +88,13 @@ jobs:
           $inner = Get-ChildItem $dir -Directory | Select-Object -First 1
           echo "FFMPEG_DIR=$($inner.FullName)" >> $env:GITHUB_ENV
           echo "$($inner.FullName)\bin" >> $env:GITHUB_PATH
+
+      # ffmpeg-sys-next caches absolute library paths from $FFMPEG_DIR, but
+      # that directory changes on every CI run (RUNNER_TEMP). Force a rebuild
+      # so the linker gets the correct cargo:rustc-link-search path.
+      - name: Clean ffmpeg-sys-next cache (Windows)
+        if: runner.os == 'Windows'
+        run: if (Test-Path target) { Remove-Item -Recurse -Force target\release\build\ffmpeg-sys-next-* }
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
