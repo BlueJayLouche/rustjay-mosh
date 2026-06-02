@@ -4,8 +4,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AudioError {
-    #[error("ffmpeg transcoding failed")]
-    TranscodeFailed,
+    #[error("ffmpeg transcoding failed: {0}")]
+    TranscodeFailed(String),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
     #[error("wav write error: {0}")]
@@ -56,7 +56,7 @@ pub fn import_audio(
     let temp_dir = tempfile::tempdir()?;
     let temp_path = temp_dir.path().join("audio.raw");
 
-    let status = std::process::Command::new(crate::bundled_ffmpeg())
+    let output = std::process::Command::new(crate::bundled_ffmpeg())
         .args([
             "-y",
             "-i", path.to_str().unwrap_or(""),
@@ -69,12 +69,18 @@ pub fn import_audio(
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|_| AudioError::TranscodeFailed)?;
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| AudioError::TranscodeFailed(format!("ffmpeg launch failed: {e}")))?;
 
-    if !status.success() {
-        return Err(AudioError::TranscodeFailed);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let msg = if stderr.trim().is_empty() {
+            format!("exit code {}", output.status)
+        } else {
+            stderr.trim().to_string()
+        };
+        return Err(AudioError::TranscodeFailed(msg));
     }
 
     let bytes = std::fs::read(&temp_path)?;

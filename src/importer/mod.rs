@@ -13,8 +13,8 @@ pub enum ImportError {
     Ffmpeg(#[from] ffmpeg::Error),
     #[error("no video stream found in file")]
     NoVideoStream,
-    #[error("ffmpeg transcoding failed")]
-    TranscodeFailed,
+    #[error("ffmpeg transcoding failed: {0}")]
+    TranscodeFailed(String),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -32,7 +32,7 @@ pub fn import_video(path: &Path, name: impl Into<String>) -> Result<(PacketClip,
     let temp_path = temp_dir.path().join("transcoded.mp4");
 
     // 1. Transcode with ffmpeg CLI to guarantee one I-frame + all P-frames.
-    let status = Command::new(crate::bundled_ffmpeg())
+    let output = Command::new(crate::bundled_ffmpeg())
         .args([
             "-y",
             "-i", path.to_str().unwrap_or(""),
@@ -48,12 +48,18 @@ pub fn import_video(path: &Path, name: impl Into<String>) -> Result<(PacketClip,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|_| ImportError::TranscodeFailed)?;
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| ImportError::TranscodeFailed(format!("ffmpeg launch failed: {e}")))?;
 
-    if !status.success() {
-        return Err(ImportError::TranscodeFailed);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let msg = if stderr.trim().is_empty() {
+            format!("exit code {}", output.status)
+        } else {
+            stderr.trim().to_string()
+        };
+        return Err(ImportError::TranscodeFailed(msg));
     }
 
     // 2. Read packets from the transcoded file.
