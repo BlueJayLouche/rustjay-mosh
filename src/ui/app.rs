@@ -14,7 +14,6 @@ use crate::packet::{OwnedPacket, PacketClip};
 use crate::preview::decoder::PacketDecoder;
 use crate::project::{self, LoadedProject, SaveRequest};
 use crate::render::delivery::ExportPreset;
-use crate::render::muxer::export_packets;
 use crate::ui::preview::{YuvPreviewCallback, YuvResources};
 use crate::ui::timeline_panel::{next_clip_color, PoolDragPayload, TimelineClip, TimelinePanel};
 
@@ -29,18 +28,21 @@ type RenderResult = Result<String, String>;
 
 /// A preview-decode request sent to the background worker:
 /// `(owning pool clip index, that clip's codec parameters, packet slice,
-/// target index within the slice, absolute timeline frame)`.
+/// target index within the slice, absolute timeline frame, playing)`.
 ///
 /// The clip's own parameters travel with the request because clips carry
 /// different H.264 SPS/PPS (different sources/encoders); the worker (re)creates
 /// its decoder from them whenever the owning clip changes, so any clip decodes
-/// correctly regardless of timeline order.
+/// correctly regardless of timeline order. `playing` selects the sequential
+/// fast path: the worker keeps its decoder warm and feeds only the packets
+/// added since the previous request, instead of re-decoding from the keyframe.
 type PreviewRequest = (
     usize,
     ffmpeg_next::codec::Parameters,
     Vec<OwnedPacket>,
     usize,
     usize,
+    bool,
 );
 
 struct BakeDone {
@@ -119,6 +121,13 @@ pub struct MoshApp {
     status: String,
     render_fps: u32,
     export_preset: ExportPreset,
+
+    // ── Playback ──────────────────────────────────────────────────────────
+    is_playing: bool,
+    /// Wall-clock time of the previous playback tick.
+    last_play_tick: Option<Instant>,
+    /// Fractional frames accumulated between ticks.
+    play_accum: f64,
 
     // ── Glitch dialog state ───────────────────────────────────────────────
     show_bend_dialog: bool,
@@ -219,6 +228,10 @@ impl MoshApp {
             render_fps: 30,
             export_preset: ExportPreset::RawMosh,
 
+            is_playing: false,
+            last_play_tick: None,
+            play_accum: 0.0,
+
             show_bend_dialog: false,
             bend_mode: 0,
             bend_duration: 0,
@@ -287,12 +300,47 @@ impl MoshApp {
         std::thread::spawn(move || {
             // (owning clip index, decoder) — rebuilt when the owning clip changes.
             let mut current: Option<(usize, PacketDecoder)> = None;
-            while let Ok((clip_idx, params, packets, target_in_slice, abs_target)) = req_rx.recv() {
+            // Sequential-playback state: packets of the current slice already
+            // fed, the absolute frame that corresponds to, and whether the
+            // decoder is warm (no EOF sent since the last keyframe feed).
+            let (mut fed, mut fed_abs, mut warm) = (0usize, 0usize, false);
+            while let Ok((clip_idx, params, packets, target_in_slice, abs_target, playing)) =
+                req_rx.recv()
+            {
                 let need_new = !matches!(&current, Some((idx, _)) if *idx == clip_idx);
                 if need_new {
                     current = PacketDecoder::new(&params).ok().map(|d| (clip_idx, d));
+                    warm = false;
                 }
-                if let Some((_, decoder)) = current.as_mut() {
+                let Some((_, decoder)) = current.as_mut() else { continue };
+                if playing {
+                    // Fast path: when this request merely extends the previous
+                    // slice, feed only the new packets — full re-decodes from
+                    // the keyframe would be quadratic over long GOPs.
+                    let extends =
+                        warm && abs_target > fed_abs && packets.len() == fed + (abs_target - fed_abs);
+                    let start = if extends {
+                        fed
+                    } else {
+                        decoder.reset();
+                        0
+                    };
+                    let mut last = None;
+                    for p in &packets[start..] {
+                        if let Some(y) = decoder.feed(p) {
+                            last = Some(y);
+                        }
+                    }
+                    fed = packets.len();
+                    fed_abs = abs_target;
+                    warm = true;
+                    if let Some(y) = last {
+                        let _ = res_tx.send((abs_target, y));
+                    }
+                } else {
+                    // Exact path for scrubbing (drains with EOF, so the
+                    // decoder is cold afterwards).
+                    warm = false;
                     let refs: Vec<&OwnedPacket> = packets.iter().collect();
                     if let Ok(yuv) = decoder.decode_up_to(&refs, target_in_slice) {
                         let _ = res_tx.send((abs_target, yuv));
@@ -563,15 +611,20 @@ impl MoshApp {
             self.status = "Nothing on the timeline to export.".into();
             return;
         }
-        let render_packets: Vec<OwnedPacket> = seq_refs
+        let render_packets: Vec<(OwnedPacket, usize)> = seq_refs
             .iter()
             .enumerate()
-            .map(|(i, (pkt, _))| OwnedPacket {
-                data: pkt.data.clone(),
-                pts: i as i64,
-                dts: i as i64,
-                duration: 1,
-                is_key: pkt.is_key,
+            .map(|(i, (pkt, owner))| {
+                (
+                    OwnedPacket {
+                        data: pkt.data.clone(),
+                        pts: i as i64,
+                        dts: i as i64,
+                        duration: 1,
+                        is_key: pkt.is_key,
+                    },
+                    *owner,
+                )
             })
             .collect();
         let leading_clip_idx = seq_refs[0].1;
@@ -579,8 +632,15 @@ impl MoshApp {
         self.proj_busy = true;
         self.status = "Exporting all platform presets…".into();
         let fps = self.render_fps;
-        let codec_params = self.packet_clips[leading_clip_idx].codec_parameters.clone();
-        let time_base = ffmpeg_next::Rational(1, fps as i32);
+        let clip_params: Vec<ffmpeg_next::codec::Parameters> = self
+            .packet_clips
+            .iter()
+            .map(|c| c.codec_parameters.clone())
+            .collect();
+        let (width, height) = {
+            let c = &self.packet_clips[leading_clip_idx];
+            (c.width, c.height)
+        };
         let total_frames = self.timeline.total_frame_count();
         let audio_sources = self.audio_clips.clone();
         let audio_timeline: Vec<AudioTimelineClip> = self.timeline.audio_clips.clone();
@@ -591,8 +651,15 @@ impl MoshApp {
             let result = (|| -> Result<PathBuf, String> {
                 let temp_dir = tempfile::tempdir().map_err(|e| format!("Temp dir: {e}"))?;
                 let video_temp = temp_dir.path().join("video.mp4");
-                export_packets(&render_packets, &video_temp, &codec_params, time_base)
-                    .map_err(|e| format!("Export: {e}"))?;
+                crate::render::wysiwyg::bake_sequence_to_mp4(
+                    &render_packets,
+                    &clip_params,
+                    width,
+                    height,
+                    fps,
+                    &video_temp,
+                )
+                .map_err(|e| format!("Export: {e}"))?;
 
                 let audio_temp_path: Option<String> = if !audio_timeline.is_empty() {
                     let audio_temp = temp_dir.path().join("audio.wav");
@@ -1414,28 +1481,25 @@ impl MoshApp {
             self.status = "Nothing on the timeline to render.".into();
             return;
         }
-        // Normalise every packet to one frame at render_fps, regardless of
-        // which clip (source vs baked) it came from. Source and baked clips
-        // carry durations stamped against their own per-clip time_bases; muxing
-        // them with a single shared time_base would otherwise rescale the
-        // baked clip's tiny durations into near-instant playback (fast-forward
-        // through baked sections). Unifying duration = 1 at time_base = 1/fps
-        // keeps every packet exactly one frame long at playback time.
-        let mut render_packets: Vec<crate::packet::OwnedPacket> =
-            Vec::with_capacity(seq_refs.len());
-        for (i, (pkt, _)) in seq_refs.iter().enumerate() {
-            render_packets.push(crate::packet::OwnedPacket {
-                data: pkt.data.clone(),
-                pts: i as i64,
-                dts: i as i64,
-                duration: 1,
-                is_key: pkt.is_key,
-            });
-        }
-        // The output stream's codec parameters must match the clip that owns the
-        // leading packet (its keyframe), not always pool clip 0 — clips carry
-        // different SPS/PPS, so a fixed clip-0 would misdeclare the stream and
-        // break decoding whenever another clip leads (e.g. after reordering).
+        // Normalise every packet to one frame at render_fps and remember which
+        // pool clip it came from — the WYSIWYG decoder rebuilds itself with the
+        // owning clip's codec parameters at keyframe boundaries.
+        let render_packets: Vec<(crate::packet::OwnedPacket, usize)> = seq_refs
+            .iter()
+            .enumerate()
+            .map(|(i, (pkt, owner))| {
+                (
+                    crate::packet::OwnedPacket {
+                        data: pkt.data.clone(),
+                        pts: i as i64,
+                        dts: i as i64,
+                        duration: 1,
+                        is_key: pkt.is_key,
+                    },
+                    *owner,
+                )
+            })
+            .collect();
         let leading_clip_idx = seq_refs[0].1;
 
         let preset = self.export_preset;
@@ -1453,8 +1517,15 @@ impl MoshApp {
         let fps = self.render_fps;
         let tx = self.render_result_tx.clone();
         let ctx = ctx.clone();
-        let codec_params = self.packet_clips[leading_clip_idx].codec_parameters.clone();
-        let time_base = ffmpeg_next::Rational(1, fps as i32);
+        let clip_params: Vec<ffmpeg_next::codec::Parameters> = self
+            .packet_clips
+            .iter()
+            .map(|c| c.codec_parameters.clone())
+            .collect();
+        let (width, height) = {
+            let c = &self.packet_clips[leading_clip_idx];
+            (c.width, c.height)
+        };
         let total_frames = self.timeline.total_frame_count();
         let audio_sources = self.audio_clips.clone();
         let audio_timeline: Vec<AudioTimelineClip> = self.timeline.audio_clips.clone();
@@ -1471,7 +1542,14 @@ impl MoshApp {
             };
             let video_temp = temp_dir.path().join("video.mp4");
 
-            let video_result = export_packets(&render_packets, &video_temp, &codec_params, time_base);
+            let video_result = crate::render::wysiwyg::bake_sequence_to_mp4(
+                &render_packets,
+                &clip_params,
+                width,
+                height,
+                fps,
+                &video_temp,
+            );
             if let Err(e) = video_result {
                 let _ = tx.send(Err(format!("Render error: {e}")));
                 ctx.request_repaint();
@@ -1576,7 +1654,14 @@ impl MoshApp {
                 .map(|c| c.codec_parameters.clone())
             {
                 if req_tx
-                    .try_send((owner_clip_idx, params, packets, target_in_slice, target))
+                    .try_send((
+                        owner_clip_idx,
+                        params,
+                        packets,
+                        target_in_slice,
+                        target,
+                        self.is_playing,
+                    ))
                     .is_err()
                 {
                     // Worker busy; flag so update() schedules a retry repaint.
@@ -1590,6 +1675,21 @@ impl MoshApp {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn toggle_playback(&mut self) {
+        if self.timeline.clips.is_empty() {
+            self.is_playing = false;
+            return;
+        }
+        self.is_playing = !self.is_playing;
+        self.last_play_tick = None;
+        self.play_accum = 0.0;
+        // Restart from the top when play is hit at the end of the timeline.
+        let total = self.timeline.total_frame_count() as i64;
+        if self.is_playing && self.timeline.playhead >= total.saturating_sub(1) {
+            self.timeline.playhead = 0;
+        }
+    }
 
     fn add_video_from_pool(&mut self, pool_idx: usize, target_frame: i64, track: u8) {
         if pool_idx >= self.packet_clips.len() { return; }
@@ -1660,8 +1760,15 @@ fn resolve_packet_at<'a>(
             }
             let drop_skip = if clip.drop_leading_keyframe { 1 } else { 0 };
             let src_idx = clip.source_offset + drop_skip + (f - clip.start_frame) as usize;
-            let packet_clip = packet_clips.get(clip.clip_idx)?;
-            return packet_clip.packets.get(src_idx).map(|p| (p, clip.clip_idx));
+            // A stale clip_idx or an out-of-range trim must not swallow the
+            // frame — fall through so the other track can still cover it.
+            match packet_clips
+                .get(clip.clip_idx)
+                .and_then(|pc| pc.packets.get(src_idx))
+            {
+                Some(p) => return Some((p, clip.clip_idx)),
+                None => continue,
+            }
         }
     }
     None
@@ -1777,22 +1884,52 @@ impl eframe::App for MoshApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(8));
         }
 
+        // ── Playback ──────────────────────────────────────────────────────────
+        if self.is_playing {
+            let total = self.timeline.total_frame_count() as i64;
+            let now = Instant::now();
+            let dt = self
+                .last_play_tick
+                .map(|t| (now - t).as_secs_f64())
+                .unwrap_or(0.0);
+            self.last_play_tick = Some(now);
+            self.play_accum += dt * self.render_fps as f64;
+            let adv = self.play_accum.floor() as i64;
+            if adv > 0 {
+                self.play_accum -= adv as f64;
+                self.timeline.playhead =
+                    (self.timeline.playhead + adv).min(total.saturating_sub(1));
+                if self.timeline.playhead >= total.saturating_sub(1) {
+                    self.is_playing = false;
+                }
+            }
+            ctx.request_repaint();
+        } else {
+            self.last_play_tick = None;
+        }
+
         // ── Keyboard shortcuts ────────────────────────────────────────────────
         // Collect intents inside the input closure, then act (acting needs `ctx`,
         // which `ctx.input` has borrowed).
-        let (do_delete, do_new, do_save, do_open, do_undo, do_redo, do_duplicate) = ctx.input(|i| {
-            let cmd = i.modifiers.command;
-            let z = i.key_pressed(egui::Key::Z);
-            (
-                i.key_pressed(egui::Key::Delete),
-                cmd && i.key_pressed(egui::Key::N),
-                cmd && i.key_pressed(egui::Key::S),
-                cmd && i.key_pressed(egui::Key::O),
-                cmd && z && !i.modifiers.shift,
-                cmd && ((z && i.modifiers.shift) || i.key_pressed(egui::Key::Y)),
-                cmd && i.key_pressed(egui::Key::D),
-            )
-        });
+        let kb_busy = ctx.wants_keyboard_input();
+        let (do_delete, do_new, do_save, do_open, do_undo, do_redo, do_duplicate, do_play) =
+            ctx.input(|i| {
+                let cmd = i.modifiers.command;
+                let z = i.key_pressed(egui::Key::Z);
+                (
+                    i.key_pressed(egui::Key::Delete),
+                    cmd && i.key_pressed(egui::Key::N),
+                    cmd && i.key_pressed(egui::Key::S),
+                    cmd && i.key_pressed(egui::Key::O),
+                    cmd && z && !i.modifiers.shift,
+                    cmd && ((z && i.modifiers.shift) || i.key_pressed(egui::Key::Y)),
+                    cmd && i.key_pressed(egui::Key::D),
+                    !kb_busy && i.key_pressed(egui::Key::Space),
+                )
+            });
+        if do_play {
+            self.toggle_playback();
+        }
         if do_delete {
             self.remove_selected_clips();
         }
@@ -1870,6 +2007,16 @@ impl eframe::App for MoshApp {
                 ui.separator();
                 if ui.button("➕ Import clip").clicked() {
                     self.open_file(ctx);
+                }
+
+                ui.separator();
+                let play_label = if self.is_playing { "⏸ Pause" } else { "▶ Play" };
+                if ui
+                    .add_enabled(!self.timeline.clips.is_empty(), egui::Button::new(play_label))
+                    .on_hover_text("Space")
+                    .clicked()
+                {
+                    self.toggle_playback();
                 }
 
                 ui.separator();

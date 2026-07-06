@@ -359,6 +359,9 @@ fn encode_yuv_to_packet_clip(
     let mut opts = ffmpeg::Dictionary::new();
     opts.set("preset", "fast");
     opts.set("crf", "18");
+    // Disable scene-cut I-frame insertion — baked clips must keep the
+    // 1-keyframe long-GOP structure so mosh operations work on them.
+    opts.set("sc_threshold", "0");
 
     let mut encoder = video.open_as_with(codec, opts)?;
 
@@ -442,7 +445,7 @@ fn encode_yuv_to_packet_clip(
     })
 }
 
-fn fill_video_frame(frame: &mut ffmpeg::util::frame::video::Video, yuv: &Yuv420) {
+pub(crate) fn fill_video_frame(frame: &mut ffmpeg::util::frame::video::Video, yuv: &Yuv420) {
     let w = yuv.width as usize;
     let h = yuv.height as usize;
     let cw = yuv.chroma_width() as usize;
@@ -560,6 +563,27 @@ mod tests {
             &CompressRegion { x: 0, y: 0, w: 0, h: 4, quality: 10 },
         );
         assert!(matches!(out, Err(BakeError::InvalidRegion { .. })));
+    }
+
+    #[test]
+    fn baked_encode_keeps_single_leading_keyframe_across_scene_cuts() {
+        ffmpeg::init().unwrap();
+        // Hard scene change every 10 frames — without sc_threshold=0 x264
+        // inserts an I-frame at each cut, breaking the long-GOP mosh model.
+        let mut frames = Vec::new();
+        for i in 0..40usize {
+            let mut f = solid_yuv(128, 128, if (i / 10) % 2 == 0 { 20 } else { 235 });
+            if (i / 10) % 2 == 1 {
+                for (j, b) in f.y.iter_mut().enumerate() {
+                    *b = ((j * 7 + i) % 256) as u8;
+                }
+            }
+            frames.push(f);
+        }
+        let cancel = AtomicBool::new(false);
+        let clip = encode_yuv_to_packet_clip(&frames, 30, &mut |_| {}, &cancel).unwrap();
+        assert_eq!(clip.packets.len(), 40);
+        assert_eq!(clip.keyframe_indices(), vec![0]);
     }
 
     #[test]

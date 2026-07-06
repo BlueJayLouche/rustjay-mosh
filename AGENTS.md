@@ -64,9 +64,7 @@ Needs: Rust 1.85+, FFmpeg 8.x, GPU with Metal/Vulkan/DX12 support.
 | `project::mod` | 480 | Project bundles: `save_bundle`/`load_bundle`, `collect_zip`, recent-projects + autosave paths, serde manifest DTOs |
 | `render::delivery` | 380 | `ExportPreset` platform delivery-encode presets (see "Delivery presets") |
 | `codec::ir` | 35 | `Yuv420` struct |
-| `datamosh::mod` | 40 | `remove_iframes`, `cross_clip_mosh` (legacy graph ops) |
-| `frame_graph::mod` | 75 | DAG of frame references (legacy, kept for reference) |
-| `format::binary` | 130 | Binary format structs (legacy from custom codec era) |
+| `render::wysiwyg` | 200 | `bake_sequence_to_mp4` — decode moshed sequence in-app, re-encode to a legal H.264 master |
 
 ## Data flow
 
@@ -96,9 +94,16 @@ Needs: Rust 1.85+, FFmpeg 8.x, GPU with Metal/Vulkan/DX12 support.
 - YUV frame is rendered via wgpu callback + BT.601 WGSL shader
 
 ### Render
-1. Build `Vec<OwnedPacket>` from timeline clips in sorted order
-2. Per clip: rebase PTS/DTS to be monotonic across the whole sequence (`pts_offset` accumulator)
-3. `export_packets()` → temp `video.mp4` (direct remux, preserves the moshed long-GOP)
+1. `build_playback_sequence()` walks the timeline frame-by-frame; per frame the
+   two-track resolver picks the top track (0) first, falling back to bottom (1)
+2. Packets are restamped pts=dts=sequence index, duration 1 at 1/fps
+3. `render::wysiwyg::bake_sequence_to_mp4()` → temp `video.mp4`: decodes the
+   moshed sequence in-app (rebuilding the decoder with the owning clip's codec
+   parameters at keyframe boundaries, holding the last good frame where the
+   decoder refuses broken references) and re-encodes to visually-lossless
+   H.264 (CRF 12, 2 s GOP). **Never direct-remux the moshed packets to the
+   final output** — the illegal reference structure makes ffmpeg drop frames
+   at every moshed cut and QuickTime/VideoToolbox freeze on it entirely.
 4. If audio clips exist: `audio::render_audio_mix()` → temp `audio.wav` (48kHz stereo f32)
 5. **Delivery pass** — `ExportPreset::build_ffmpeg_args()` (in `render/delivery.rs`)
    produces the final ffmpeg CLI args from the user-selected export preset
@@ -184,7 +189,7 @@ my_project.rjmosh/
 
 | Want to… | Look at |
 |---|---|
-| Add a new mosh operation | `datamosh/mod.rs`, `ui/app.rs` right-panel buttons |
+| Add a new mosh operation | `ui/app.rs` — `cross_clip_mosh()` + right-panel buttons |
 | Change timeline drag behavior | `ui/timeline_panel.rs` — `DragMode`, hit-test, drag logic |
 | Add new render format | `render/muxer.rs`, `start_render()` in `ui/app.rs` |
 | Add/adjust a delivery (export) preset | `render/delivery.rs` — `ExportPreset` enum + `filter()` / `video_codec_args()` |

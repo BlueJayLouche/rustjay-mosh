@@ -29,6 +29,35 @@ impl PacketDecoder {
         Ok(Self { decoder })
     }
 
+    /// Reset decoder state (flush) so a fresh keyframe-rooted feed can begin.
+    pub fn reset(&mut self) {
+        self.decoder.flush();
+    }
+
+    /// Feed one packet and return the newest decoded frame, if one surfaced.
+    /// Used for sequential playback: no EOF is sent, so the stream can keep
+    /// going with further `feed` calls. With threaded decoding the returned
+    /// frame may lag the fed packet by a few frames — invisible during
+    /// playback; use [`decode_up_to`](Self::decode_up_to) for exact scrubbing.
+    pub fn feed(&mut self, pkt: &OwnedPacket) -> Option<Arc<Yuv420>> {
+        let mut packet = ffmpeg::codec::packet::Packet::copy(&pkt.data);
+        packet.set_pts(Some(pkt.pts));
+        packet.set_dts(Some(pkt.dts));
+        packet.set_duration(pkt.duration);
+        if pkt.is_key {
+            packet.set_flags(ffmpeg::codec::packet::Flags::KEY);
+        }
+        if self.decoder.send_packet(&packet).is_err() {
+            return None;
+        }
+        let mut frame = ffmpeg::util::frame::video::Video::empty();
+        let mut last = None;
+        while self.decoder.receive_frame(&mut frame).is_ok() {
+            last = Some(Arc::new(copy_yuv_from_frame(&frame)));
+        }
+        last
+    }
+
     /// Decode packets up to `target_idx` (inclusive) and return the last
     /// decoded YUV420 frame. To handle scrubbing, the decoder is flushed and
     /// decoding restarts from the nearest preceding keyframe.
@@ -190,7 +219,7 @@ impl PacketDecoder {
     }
 }
 
-fn copy_yuv_from_frame(frame: &ffmpeg::util::frame::video::Video) -> Yuv420 {
+pub(crate) fn copy_yuv_from_frame(frame: &ffmpeg::util::frame::video::Video) -> Yuv420 {
     let width = frame.width();
     let height = frame.height();
     let cw = (width / 2) as usize;
