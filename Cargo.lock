@@ -3422,7 +3422,7 @@ dependencies = [
 
 [[package]]
 name = "rustjay-mosh"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "dirs",
  "eframe",

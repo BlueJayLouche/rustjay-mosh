@@ -7,7 +7,10 @@ use eframe::egui::{self, CursorIcon};
 use eframe::egui_wgpu;
 
 use crate::audio::{import_audio, AudioClip, AudioTimelineClip};
-use crate::bake::{BendMode, CompressRegion, Effect, bake_segment};
+use crate::bake::{
+    BendMode, CompressRegion, Effect, SortDir, SortKey, bake_segment, bend_yuv, compress_region,
+    yuv_to_rgba,
+};
 use crate::codec::ir::Yuv420;
 use crate::importer::import_video;
 use crate::packet::{OwnedPacket, PacketClip};
@@ -131,7 +134,7 @@ pub struct MoshApp {
 
     // ── Glitch dialog state ───────────────────────────────────────────────
     show_bend_dialog: bool,
-    bend_mode: usize,       // 0=ReverseScanlines, 1=Echo, 2=Bitcrush, 3=ByteSwap, 4=Xor, 5=Noise
+    bend_mode: usize,       // index into the bend-dialog mode list
     bend_duration: usize,   // 0=1frame, 1=±5, 2=±15, 3=whole
     bend_echo_delay: usize,
     bend_echo_mix: f32,
@@ -139,6 +142,19 @@ pub struct MoshApp {
     bend_byteswap_stride: usize,
     bend_xor_mask: u8,
     bend_noise_amount: u8,
+    bend_sort_dir: SortDir,
+    bend_sort_key: SortKey,
+    bend_sort_lo: u8,
+    bend_sort_hi: u8,
+    bend_sort_reverse: bool,
+    bend_ring_amount: f32,
+    bend_ring_period: usize,
+    bend_shift_dx: i32,
+    bend_shift_dy: i32,
+    bend_shift_wrap: bool,
+    /// Cached dialog preview: (params it was rendered with, source frame, texture).
+    bend_preview_tex: Option<(BendMode, Arc<Yuv420>, egui::TextureHandle)>,
+    compress_preview_tex: Option<(CompressRegion, Arc<Yuv420>, egui::TextureHandle)>,
 
     show_compress_dialog: bool,
     compress_x: u32,
@@ -241,6 +257,18 @@ impl MoshApp {
             bend_byteswap_stride: 4,
             bend_xor_mask: 0xFF,
             bend_noise_amount: 32,
+            bend_sort_dir: SortDir::Horizontal,
+            bend_sort_key: SortKey::Luma,
+            bend_sort_lo: 64,
+            bend_sort_hi: 192,
+            bend_sort_reverse: false,
+            bend_ring_amount: 0.8,
+            bend_ring_period: 4,
+            bend_shift_dx: 4,
+            bend_shift_dy: 0,
+            bend_shift_wrap: true,
+            bend_preview_tex: None,
+            compress_preview_tex: None,
 
             show_compress_dialog: false,
             compress_x: 0,
@@ -1087,6 +1115,9 @@ impl MoshApp {
                     "Byte swap",
                     "XOR mask",
                     "Noise",
+                    "Pixel sort",
+                    "Ringing",
+                    "Chroma shift",
                 ];
                 egui::ComboBox::from_label("")
                     .selected_text(modes[self.bend_mode.min(modes.len() - 1)])
@@ -1131,14 +1162,73 @@ impl MoshApp {
                             ui.add(egui::DragValue::new(&mut self.bend_noise_amount).range(1..=128));
                         });
                     }
+                    6 => {
+                        ui.horizontal(|ui| {
+                            ui.label("Direction:");
+                            ui.radio_value(&mut self.bend_sort_dir, SortDir::Horizontal, "Horizontal");
+                            ui.radio_value(&mut self.bend_sort_dir, SortDir::Vertical, "Vertical");
+                            ui.checkbox(&mut self.bend_sort_reverse, "Reverse");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Sort by:");
+                            ui.radio_value(&mut self.bend_sort_key, SortKey::Luma, "Luma");
+                            ui.radio_value(&mut self.bend_sort_key, SortKey::Hue, "Hue");
+                            ui.radio_value(&mut self.bend_sort_key, SortKey::Saturation, "Saturation");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Threshold:");
+                            ui.add(egui::DragValue::new(&mut self.bend_sort_lo).range(0..=255));
+                            ui.label("to");
+                            ui.add(egui::DragValue::new(&mut self.bend_sort_hi).range(0..=255));
+                        });
+                    }
+                    7 => {
+                        ui.horizontal(|ui| {
+                            ui.label("Amount:");
+                            ui.add(egui::Slider::new(&mut self.bend_ring_amount, 0.0..=2.0));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Period:");
+                            ui.add(egui::DragValue::new(&mut self.bend_ring_period).range(1..=32));
+                        });
+                    }
+                    8 => {
+                        ui.horizontal(|ui| {
+                            ui.label("Shift X:");
+                            ui.add(egui::DragValue::new(&mut self.bend_shift_dx).range(-64..=64));
+                            ui.label("Y:");
+                            ui.add(egui::DragValue::new(&mut self.bend_shift_dy).range(-64..=64));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Edges:");
+                            ui.radio_value(&mut self.bend_shift_wrap, true, "Wrap");
+                            ui.radio_value(&mut self.bend_shift_wrap, false, "Clamp");
+                        });
+                    }
                     _ => {}
                 }
+
+                ui.add_space(8.0);
+                // Preview with a stable seed so noise doesn't reshuffle each repaint.
+                let mode = self.bend_mode_from_state(0);
+                let src = self.current_preview_yuv();
+                Self::draw_effect_preview(
+                    ui,
+                    &mut self.bend_preview_tex,
+                    src,
+                    mode,
+                    "bend_preview",
+                    |frame| bend_yuv(frame, mode),
+                );
 
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     let apply = ui.add_enabled(!busy, egui::Button::new("Apply"));
                     if apply.clicked() {
-                        self.apply_bake(Effect::Bend(self.bend_mode_from_state()), &ctx_clone);
+                        self.apply_bake(
+                            Effect::Bend(self.bend_mode_from_state(rand::random::<u64>())),
+                            &ctx_clone,
+                        );
                         self.show_bend_dialog = false;
                     }
                     if ui.button("Cancel").clicked() {
@@ -1147,9 +1237,14 @@ impl MoshApp {
                 });
             });
         self.show_bend_dialog = open;
+        if !self.show_bend_dialog {
+            self.bend_preview_tex = None;
+        }
     }
 
-    fn bend_mode_from_state(&self) -> BendMode {
+    /// Build the `BendMode` from dialog state. `noise_seed` is injected so the
+    /// dialog preview can use a stable seed while Apply rolls a fresh one.
+    fn bend_mode_from_state(&self, noise_seed: u64) -> BendMode {
         match self.bend_mode {
             0 => BendMode::ReverseScanlines,
             1 => BendMode::Echo { delay: self.bend_echo_delay, mix: self.bend_echo_mix },
@@ -1158,9 +1253,60 @@ impl MoshApp {
             4 => BendMode::Xor { mask: self.bend_xor_mask },
             5 => BendMode::Noise {
                 amount: self.bend_noise_amount,
-                seed: rand::random::<u64>(),
+                seed: noise_seed,
+            },
+            6 => BendMode::PixelSort {
+                dir: self.bend_sort_dir,
+                key: self.bend_sort_key,
+                lo: self.bend_sort_lo,
+                hi: self.bend_sort_hi,
+                reverse: self.bend_sort_reverse,
+            },
+            7 => BendMode::Ringing {
+                amount: self.bend_ring_amount,
+                period: self.bend_ring_period,
+            },
+            8 => BendMode::ChromaShift {
+                dx: self.bend_shift_dx,
+                dy: self.bend_shift_dy,
+                wrap: self.bend_shift_wrap,
             },
             _ => BendMode::ReverseScanlines,
+        }
+    }
+
+    /// Draw a live effect preview inside a dialog: applies `apply` to a copy of
+    /// the current playhead frame, re-rendering only when `params` or the
+    /// source frame changed. Synchronous on the UI thread by design — worst
+    /// case (1080p pixel sort) is a few tens of ms per parameter change.
+    fn draw_effect_preview<P: PartialEq + Copy>(
+        ui: &mut egui::Ui,
+        cache: &mut Option<(P, Arc<Yuv420>, egui::TextureHandle)>,
+        src: Option<Arc<Yuv420>>,
+        params: P,
+        tex_name: &str,
+        apply: impl FnOnce(&mut Yuv420),
+    ) {
+        let Some(src) = src else {
+            ui.weak("No frame at the playhead to preview.");
+            return;
+        };
+        let stale = match cache {
+            Some((p, s, _)) => *p != params || !Arc::ptr_eq(s, &src),
+            None => true,
+        };
+        if stale {
+            let mut frame = (*src).clone();
+            apply(&mut frame);
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [frame.width as usize, frame.height as usize],
+                &yuv_to_rgba(&frame),
+            );
+            let tex = ui.ctx().load_texture(tex_name, image, egui::TextureOptions::LINEAR);
+            *cache = Some((params, src, tex));
+        }
+        if let Some((_, _, tex)) = cache {
+            ui.add(egui::Image::new(&*tex).max_size(egui::vec2(420.0, 240.0)));
         }
     }
 
@@ -1222,17 +1368,32 @@ impl MoshApp {
                 ui.label("Quality (lower = more artifacts):");
                 ui.add(egui::Slider::new(&mut self.compress_quality, 1..=100));
 
+                let region = CompressRegion {
+                    x: self.compress_x,
+                    y: self.compress_y,
+                    w: self.compress_w,
+                    h: self.compress_h,
+                    quality: self.compress_quality,
+                };
+
+                ui.add_space(8.0);
+                let src = self.current_preview_yuv();
+                Self::draw_effect_preview(
+                    ui,
+                    &mut self.compress_preview_tex,
+                    src,
+                    region,
+                    "compress_preview",
+                    |frame| {
+                        // An out-of-bounds region just previews unmodified.
+                        let _ = compress_region(frame, &region);
+                    },
+                );
+
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     let apply = ui.add_enabled(!busy, egui::Button::new("Apply"));
                     if apply.clicked() {
-                        let region = CompressRegion {
-                            x: self.compress_x,
-                            y: self.compress_y,
-                            w: self.compress_w,
-                            h: self.compress_h,
-                            quality: self.compress_quality,
-                        };
                         self.apply_bake(Effect::Compress(region), &ctx_clone);
                         self.show_compress_dialog = false;
                     }
@@ -1242,6 +1403,9 @@ impl MoshApp {
                 });
             });
         self.show_compress_dialog = open;
+        if !self.show_compress_dialog {
+            self.compress_preview_tex = None;
+        }
     }
 
     /// Map the dialog "Duration" radio index to a `(start, count)` pair in

@@ -43,7 +43,7 @@ pub enum BakeError {
 // Data bending
 // ------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BendMode {
     /// Reverse the byte order of every scanline in the Y plane.
     ReverseScanlines,
@@ -57,6 +57,45 @@ pub enum BendMode {
     Xor { mask: u8 },
     /// Add deterministic pseudo-random noise in range ±amount, seeded by `seed`.
     Noise { amount: u8, seed: u64 },
+    /// Asendorf-style pixel sorting: sort runs of pixels whose key value lies
+    /// in `lo..=hi`, along `dir`, descending when `reverse`.
+    PixelSort { dir: SortDir, key: SortKey, lo: u8, hi: u8, reverse: bool },
+    /// Oscillating edge ghosts (analog-TV / over-sharpened look) on the Y
+    /// plane, horizontal. `amount` is echo strength, `period` the ghost
+    /// spacing in pixels.
+    Ringing { amount: f32, period: usize },
+    /// Shift the U plane by (dx, dy) and the V plane by (-dx, -dy) —
+    /// chromatic-aberration colour bleed. Offsets are in chroma pixels.
+    /// `wrap` rolls pixels around the frame edge; otherwise edges clamp
+    /// (lens-style aberration).
+    ChromaShift { dx: i32, dy: i32, wrap: bool },
+}
+
+impl BendMode {
+    /// Per-frame variant of this mode: noise reseeds each frame so grain
+    /// animates instead of sticking to the screen like a dirty pane.
+    pub fn for_frame(self, frame: u64) -> Self {
+        match self {
+            BendMode::Noise { amount, seed } => BendMode::Noise {
+                amount,
+                seed: seed.wrapping_add(frame),
+            },
+            m => m,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDir {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Luma,
+    Hue,
+    Saturation,
 }
 
 /// Apply a databending effect to a decoded YUV420 frame in-place.
@@ -121,6 +160,139 @@ pub fn bend_yuv(yuv: &mut Yuv420, mode: BendMode) {
                 }
             }
         }
+        BendMode::PixelSort { dir, key, lo, hi, reverse } => {
+            pixel_sort(yuv, dir, key, lo, hi, reverse);
+        }
+        BendMode::Ringing { amount, period } => {
+            ringing(yuv, amount, period.max(1));
+        }
+        BendMode::ChromaShift { dx, dy, wrap } => {
+            let cw = yuv.chroma_width() as usize;
+            let ch = yuv.chroma_height() as usize;
+            shift_plane(&mut yuv.u, cw, ch, dx, dy, wrap);
+            shift_plane(&mut yuv.v, cw, ch, -dx, -dy, wrap);
+        }
+    }
+}
+
+/// Sort value 0-255 for an RGB pixel under the given key.
+fn sort_key_value(key: SortKey, r: u8, g: u8, b: u8) -> u8 {
+    match key {
+        SortKey::Luma => (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) as u8,
+        SortKey::Hue => {
+            let (max, min) = (r.max(g).max(b) as f32, r.min(g).min(b) as f32);
+            let d = max - min;
+            if d == 0.0 {
+                return 0;
+            }
+            let (r, g, b) = (r as f32, g as f32, b as f32);
+            let h = if max == r {
+                ((g - b) / d).rem_euclid(6.0)
+            } else if max == g {
+                (b - r) / d + 2.0
+            } else {
+                (r - g) / d + 4.0
+            };
+            (h / 6.0 * 255.0) as u8
+        }
+        SortKey::Saturation => {
+            let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+            if max == 0 { 0 } else { ((max - min) as u32 * 255 / max as u32) as u8 }
+        }
+    }
+}
+
+fn pixel_sort(yuv: &mut Yuv420, dir: SortDir, key: SortKey, lo: u8, hi: u8, reverse: bool) {
+    let (lines, len) = match dir {
+        SortDir::Horizontal => (yuv.height, yuv.width),
+        SortDir::Vertical => (yuv.width, yuv.height),
+    };
+    let coord = |line: u32, i: u32| match dir {
+        SortDir::Horizontal => (i, line),
+        SortDir::Vertical => (line, i),
+    };
+    let (lo, hi) = (lo.min(hi), lo.max(hi));
+
+    for line in 0..lines {
+        let px: Vec<(u8, u8, u8)> = (0..len)
+            .map(|i| {
+                let (x, y) = coord(line, i);
+                yuv_pixel_to_rgb(yuv, x, y)
+            })
+            .collect();
+        let keys: Vec<u8> = px.iter().map(|&(r, g, b)| sort_key_value(key, r, g, b)).collect();
+
+        // Find maximal runs whose key lies in the threshold band and sort each.
+        let mut i = 0usize;
+        while i < len as usize {
+            if keys[i] < lo || keys[i] > hi {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < len as usize && keys[i] >= lo && keys[i] <= hi {
+                i += 1;
+            }
+            if i - start < 2 {
+                continue;
+            }
+            let mut run: Vec<usize> = (start..i).collect();
+            run.sort_by_key(|&j| keys[j]);
+            if reverse {
+                run.reverse();
+            }
+            for (offset, &src) in run.iter().enumerate() {
+                let (x, y) = coord(line, (start + offset) as u32);
+                let (r, g, b) = px[src];
+                let (yy, uu, vv) = rgb_to_yuv(r, g, b);
+                set_yuv_pixel(yuv, x, y, yy, uu, vv);
+            }
+        }
+    }
+}
+
+fn ringing(yuv: &mut Yuv420, amount: f32, period: usize) {
+    let w = yuv.width as usize;
+    // ponytail: fixed 3 alternating decaying taps — parametrise if anyone asks.
+    const TAPS: usize = 3;
+    const DECAY: f32 = 0.6;
+    for row in yuv.y.chunks_exact_mut(w) {
+        let orig: Vec<u8> = row.to_vec();
+        for x in 0..w {
+            let mut acc = orig[x] as f32;
+            let mut gain = amount;
+            for k in 1..=TAPS {
+                let d = k * period;
+                if x < d + 1 {
+                    break;
+                }
+                // Edge (gradient) `d` pixels back, echoed with alternating sign.
+                let edge = orig[x - d] as f32 - orig[x - d - 1] as f32;
+                acc += if k % 2 == 1 { gain } else { -gain } * edge;
+                gain *= DECAY;
+            }
+            row[x] = acc.clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+fn shift_plane(plane: &mut [u8], w: usize, h: usize, dx: i32, dy: i32, wrap: bool) {
+    let orig = plane.to_vec();
+    for y in 0..h {
+        for x in 0..w {
+            let (sx, sy) = if wrap {
+                (
+                    (x as i32 - dx).rem_euclid(w as i32) as usize,
+                    (y as i32 - dy).rem_euclid(h as i32) as usize,
+                )
+            } else {
+                (
+                    (x as i32 - dx).clamp(0, w as i32 - 1) as usize,
+                    (y as i32 - dy).clamp(0, h as i32 - 1) as usize,
+                )
+            };
+            plane[y * w + x] = orig[sy * w + sx];
+        }
     }
 }
 
@@ -128,7 +300,7 @@ pub fn bend_yuv(yuv: &mut Yuv420, mode: BendMode) {
 // Compression artifacting (JPEG re-compress region)
 // ------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CompressRegion {
     pub x: u32,
     pub y: u32,
@@ -296,7 +468,7 @@ pub fn bake_segment(
     let frame_total = frames.len() as f32;
     for (i, yuv) in frames.iter_mut().enumerate() {
         match &effect {
-            Effect::Bend(mode) => bend_yuv(yuv, *mode),
+            Effect::Bend(mode) => bend_yuv(yuv, mode.for_frame(i as u64)),
             Effect::Compress(region) => compress_region(yuv, region)?,
         }
         progress(0.30 + 0.40 * ((i as f32 + 1.0) / frame_total));
@@ -543,6 +715,111 @@ mod tests {
         bend_yuv(&mut c, BendMode::Noise { amount: 16, seed: 43 });
         assert_eq!(a.y, b.y, "same seed → same output");
         assert_ne!(a.y, c.y, "different seed → different output");
+    }
+
+    #[test]
+    fn pixel_sort_sorts_luma_runs_in_band() {
+        // Grey pixels (chroma 128) survive the RGB round-trip exactly, so the
+        // Y plane must come back sorted.
+        let mut yuv = solid_yuv(6, 2, 0);
+        yuv.y[..6].copy_from_slice(&[200, 50, 180, 90, 120, 30]);
+        yuv.y[6..].copy_from_slice(&[200, 50, 180, 90, 120, 30]);
+        bend_yuv(&mut yuv, BendMode::PixelSort {
+            dir: SortDir::Horizontal,
+            key: SortKey::Luma,
+            lo: 0,
+            hi: 255,
+            reverse: false,
+        });
+        assert_eq!(&yuv.y[..6], &[30, 50, 90, 120, 180, 200]);
+    }
+
+    #[test]
+    fn pixel_sort_leaves_pixels_outside_band_untouched() {
+        let mut yuv = solid_yuv(6, 2, 0);
+        yuv.y[..6].copy_from_slice(&[250, 50, 40, 30, 20, 250]);
+        // Band 0..=100: only the middle run [50,40,30,20] sorts; 250s stay put.
+        bend_yuv(&mut yuv, BendMode::PixelSort {
+            dir: SortDir::Horizontal,
+            key: SortKey::Luma,
+            lo: 0,
+            hi: 100,
+            reverse: false,
+        });
+        assert_eq!(&yuv.y[..6], &[250, 20, 30, 40, 50, 250]);
+    }
+
+    #[test]
+    fn pixel_sort_vertical_reverse_descends() {
+        let mut yuv = solid_yuv(2, 4, 0);
+        for (i, v) in [10u8, 10, 200, 200, 40, 40, 90, 90].iter().enumerate() {
+            yuv.y[i] = *v;
+        }
+        bend_yuv(&mut yuv, BendMode::PixelSort {
+            dir: SortDir::Vertical,
+            key: SortKey::Luma,
+            lo: 0,
+            hi: 255,
+            reverse: true,
+        });
+        // Column 0 was [10, 200, 40, 90] → descending.
+        assert_eq!([yuv.y[0], yuv.y[2], yuv.y[4], yuv.y[6]], [200, 90, 40, 10]);
+    }
+
+    #[test]
+    fn ringing_ghosts_after_edge_but_leaves_flat_areas_alone() {
+        let mut flat = solid_yuv(32, 2, 128);
+        bend_yuv(&mut flat, BendMode::Ringing { amount: 1.0, period: 4 });
+        assert!(flat.y.iter().all(|&b| b == 128), "no edges → no change");
+
+        // Step edge at x=8: 0 → 200.
+        let mut yuv = solid_yuv(32, 2, 0);
+        for row in 0..2 {
+            for x in 8..32 {
+                yuv.y[row * 32 + x] = 200;
+            }
+        }
+        bend_yuv(&mut yuv, BendMode::Ringing { amount: 0.5, period: 4 });
+        // First tap: edge echoed 4px after the step.
+        assert!(yuv.y[12] > 200, "positive ghost expected at x=12, got {}", yuv.y[12]);
+        assert!(yuv.y[16] < 200, "negative ghost expected at x=16, got {}", yuv.y[16]);
+    }
+
+    #[test]
+    fn chroma_shift_wraps_planes_in_opposite_directions() {
+        let mut yuv = solid_yuv(8, 8, 128);
+        // chroma planes are 4×4
+        yuv.u[0] = 10; // (0,0)
+        yuv.v[0] = 20;
+        bend_yuv(&mut yuv, BendMode::ChromaShift { dx: 1, dy: 0, wrap: true });
+        assert_eq!(yuv.u[1], 10, "U shifts +x");
+        assert_eq!(yuv.v[3], 20, "V shifts -x, wrapping to the last column");
+        assert_eq!(yuv.y, solid_yuv(8, 8, 128).y, "luma untouched");
+    }
+
+    #[test]
+    fn chroma_shift_clamp_extends_edges_instead_of_wrapping() {
+        let mut yuv = solid_yuv(8, 8, 128);
+        yuv.u[0] = 10; // (0,0) in the 4×4 chroma plane
+        bend_yuv(&mut yuv, BendMode::ChromaShift { dx: 1, dy: 0, wrap: false });
+        assert_eq!(yuv.u[1], 10, "U shifts +x");
+        assert_eq!(yuv.u[0], 10, "left edge clamps, repeating the edge value");
+        assert_eq!(yuv.u[3], 128, "nothing wraps in from the far edge");
+    }
+
+    #[test]
+    fn noise_reseeds_per_frame_so_grain_animates() {
+        let mode = BendMode::Noise { amount: 16, seed: 7 };
+        let mut a = solid_yuv(8, 8, 128);
+        let mut b = solid_yuv(8, 8, 128);
+        bend_yuv(&mut a, mode.for_frame(0));
+        bend_yuv(&mut b, mode.for_frame(1));
+        assert_ne!(a.y, b.y, "consecutive frames must get different noise");
+        // Non-noise modes are frame-invariant.
+        assert_eq!(
+            BendMode::Bitcrush { bits: 3 }.for_frame(9),
+            BendMode::Bitcrush { bits: 3 },
+        );
     }
 
     #[test]
