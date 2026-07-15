@@ -522,14 +522,22 @@ fn encode_yuv_to_packet_clip(
     video.set_format(ffmpeg::util::format::Pixel::YUV420P);
     video.set_time_base(enc_tb);
     video.set_frame_rate(Some(ffmpeg::Rational(fps as i32, 1)));
-    video.set_gop(u32::MAX);
+    // Same value as the importer's `-g`. NOT u32::MAX: gop_size is a C int, so
+    // u32::MAX truncates to -1 and x264 silently falls back to keyint=250,
+    // inserting mid-clip keyframes that snap moshes back.
+    video.set_gop(99_999_999);
     video.set_max_b_frames(0);
     if global_header {
         video.set_flags(ffmpeg::codec::Flags::GLOBAL_HEADER);
     }
 
     let mut opts = ffmpeg::Dictionary::new();
-    opts.set("preset", "fast");
+    // MUST match the importer's x264 config (preset, refs, no B-frames).
+    // Mosh drops keyframes, so baked P-frames get parsed under the *source*
+    // clip's SPS/PPS — structurally different headers make the decoder refuse
+    // every frame and the span renders as one held frame.
+    opts.set("preset", "veryfast");
+    opts.set("refs", "1");
     opts.set("crf", "18");
     // Disable scene-cut I-frame insertion — baked clips must keep the
     // 1-keyframe long-GOP structure so mosh operations work on them.
@@ -595,7 +603,7 @@ fn encode_yuv_to_packet_clip(
         if s.index() != idx {
             continue;
         }
-        let data = p.data().unwrap_or(&[]).to_vec();
+        let data: std::sync::Arc<[u8]> = p.data().unwrap_or(&[]).into();
         let is_key = p.flags().contains(ffmpeg::codec::packet::Flags::KEY);
         packets.push(OwnedPacket {
             data,
@@ -847,8 +855,10 @@ mod tests {
         ffmpeg::init().unwrap();
         // Hard scene change every 10 frames — without sc_threshold=0 x264
         // inserts an I-frame at each cut, breaking the long-GOP mosh model.
+        // 260 frames also crosses x264's default keyint of 250, which kicks in
+        // silently if the huge GOP value doesn't survive the C int conversion.
         let mut frames = Vec::new();
-        for i in 0..40usize {
+        for i in 0..260usize {
             let mut f = solid_yuv(128, 128, if (i / 10) % 2 == 0 { 20 } else { 235 });
             if (i / 10) % 2 == 1 {
                 for (j, b) in f.y.iter_mut().enumerate() {
@@ -859,8 +869,281 @@ mod tests {
         }
         let cancel = AtomicBool::new(false);
         let clip = encode_yuv_to_packet_clip(&frames, 30, &mut |_| {}, &cancel).unwrap();
-        assert_eq!(clip.packets.len(), 40);
+        assert_eq!(clip.packets.len(), 260);
         assert_eq!(clip.keyframe_indices(), vec![0]);
+    }
+
+    /// Mean absolute luma difference between two frames.
+    fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (*x as f64 - *y as f64).abs())
+            .sum::<f64>()
+            / a.len() as f64
+    }
+
+    #[test]
+    fn bake_pixel_sort_and_ringing_preserve_motion() {
+        ffmpeg::init().unwrap();
+        // 30 frames of a bright block sliding 4 px per frame on a dark field.
+        let mut frames = Vec::new();
+        for i in 0..30usize {
+            let mut f = solid_yuv(128, 128, 30);
+            for y in 20..36 {
+                for x in (i * 4)..(i * 4 + 16) {
+                    f.y[y * 128 + x] = 220;
+                }
+            }
+            frames.push(f);
+        }
+        let cancel = AtomicBool::new(false);
+        let clip = encode_yuv_to_packet_clip(&frames, 30, &mut |_| {}, &cancel).unwrap();
+
+        for effect in [
+            Effect::Bend(BendMode::PixelSort {
+                dir: SortDir::Horizontal,
+                key: SortKey::Luma,
+                lo: 100,
+                hi: 255,
+                reverse: false,
+            }),
+            Effect::Bend(BendMode::Ringing { amount: 0.8, period: 4 }),
+        ] {
+            // Mid-clip range so the keyframe-seek decode path is exercised too.
+            let baked =
+                bake_segment(&clip, 5, 20, effect.clone(), 30, &mut |_| {}, &cancel).unwrap();
+            assert_eq!(baked.packets.len(), 20, "{effect:?}: wrong frame count");
+
+            let refs: Vec<&OwnedPacket> = baked.packets.iter().collect();
+            let mut dec = PacketDecoder::new(&baked.codec_parameters).unwrap();
+            let out = dec.decode_all(&refs).unwrap();
+            assert_eq!(out.len(), 20, "{effect:?}: baked clip lost frames");
+
+            let moved = out
+                .iter()
+                .skip(10)
+                .any(|f| mean_abs_diff(&f.y, &out[0].y) > 2.0);
+            assert!(moved, "{effect:?}: baked output is frozen on its first frame");
+        }
+    }
+
+    #[test]
+    fn baked_overlay_renders_motion_through_wysiwyg() {
+        ffmpeg::init().unwrap();
+        // 60-frame moving source; frames 20..40 baked with pixel sort and
+        // overlaid on V1 exactly like finish_bake does. The WYSIWYG render of
+        // that two-track sequence must keep motion inside the baked span.
+        let mut frames = Vec::new();
+        for i in 0..60usize {
+            let mut f = solid_yuv(128, 128, 30);
+            let x0 = (i * 2).min(110);
+            for y in 20..36 {
+                for x in x0..x0 + 16 {
+                    f.y[y * 128 + x] = 220;
+                }
+            }
+            frames.push(f);
+        }
+        let cancel = AtomicBool::new(false);
+        let source = encode_yuv_to_packet_clip(&frames, 30, &mut |_| {}, &cancel).unwrap();
+        let effect = Effect::Bend(BendMode::PixelSort {
+            dir: SortDir::Horizontal,
+            key: SortKey::Luma,
+            lo: 100,
+            hi: 255,
+            reverse: false,
+        });
+        let baked = bake_segment(&source, 20, 20, effect, 30, &mut |_| {}, &cancel).unwrap();
+
+        // Variant 1: baked clip keeps its keyframe (plain overlay).
+        // Variant 2: leading keyframe dropped (cross-clip mosh) — the baked
+        // P-frames bleed from the source's decoder state.
+        for drop_key in [false, true] {
+            let mut seq: Vec<(OwnedPacket, usize)> = Vec::new();
+            for f in 0..60usize {
+                let (pkt, owner) = if (20..40).contains(&f) {
+                    let skip = if drop_key { 1 } else { 0 };
+                    match baked.packets.get(f - 20 + skip) {
+                        Some(p) => (p, 1usize),
+                        None => (&source.packets[f], 0usize),
+                    }
+                } else {
+                    (&source.packets[f], 0usize)
+                };
+                let i = seq.len() as i64;
+                seq.push((
+                    OwnedPacket {
+                        data: pkt.data.clone(),
+                        pts: i,
+                        dts: i,
+                        duration: 1,
+                        is_key: pkt.is_key,
+                    },
+                    owner,
+                ));
+            }
+
+            let params = [source.codec_parameters.clone(), baked.codec_parameters.clone()];
+            let tmp = tempfile::tempdir().unwrap();
+            let out_path = tmp.path().join("wys.mp4");
+            let emitted = crate::render::wysiwyg::bake_sequence_to_mp4(
+                &seq, &params, 128, 128, 30, &out_path,
+            )
+            .unwrap();
+            assert_eq!(emitted, 60);
+
+            let clip = crate::importer::read_clip_from_mp4(&out_path, "check", 0).unwrap();
+            let refs: Vec<&OwnedPacket> = clip.packets.iter().collect();
+            let mut dec = PacketDecoder::new(&clip.codec_parameters).unwrap();
+            let out = dec.decode_all(&refs).unwrap();
+            assert_eq!(out.len(), 60);
+
+            let moved = (22..38).any(|i| mean_abs_diff(&out[i].y, &out[21].y) > 2.0);
+            assert!(
+                moved,
+                "baked overlay (drop_key={drop_key}) is frozen in the rendered output"
+            );
+        }
+    }
+
+    /// Mirror of the preview worker's `playing` fast path: one decoder, packets
+    /// fed strictly in sequence order, newest surfaced frame shown per step.
+    /// The user's real timelines have a single keyframe at position 0 (every
+    /// later span is mid-GOP or mosh-dropped), so playback must still show
+    /// motion inside a baked pixel-sort overlay.
+    #[test]
+    fn sequential_feed_playback_shows_motion_in_baked_overlay() {
+        ffmpeg::init().unwrap();
+        let mut frames = Vec::new();
+        for i in 0..60usize {
+            let mut f = solid_yuv(128, 128, 30);
+            let x0 = (i * 2).min(110);
+            for y in 20..36 {
+                for x in x0..x0 + 16 {
+                    f.y[y * 128 + x] = 220;
+                }
+            }
+            frames.push(f);
+        }
+        let cancel = AtomicBool::new(false);
+        let source = encode_yuv_to_packet_clip(&frames, 30, &mut |_| {}, &cancel).unwrap();
+        let effect = Effect::Bend(BendMode::PixelSort {
+            dir: SortDir::Horizontal,
+            key: SortKey::Luma,
+            lo: 64,
+            hi: 192,
+            reverse: false,
+        });
+        let baked = bake_segment(&source, 20, 20, effect, 30, &mut |_| {}, &cancel).unwrap();
+
+        // Timeline shape: source 0..20, baked overlay (keyframe dropped, mosh)
+        // 20..39, source resumes mid-GOP 39..60.
+        let mut seq: Vec<OwnedPacket> = Vec::new();
+        for f in 0..60usize {
+            let pkt = if (20..39).contains(&f) {
+                &baked.packets[f - 20 + 1]
+            } else {
+                &source.packets[f]
+            };
+            let i = seq.len() as i64;
+            seq.push(OwnedPacket {
+                data: pkt.data.clone(),
+                pts: i,
+                dts: i,
+                duration: 1,
+                is_key: pkt.is_key,
+            });
+        }
+
+        let mut dec = PacketDecoder::new(&source.codec_parameters).unwrap();
+        let mut shown: Vec<std::sync::Arc<Yuv420>> = Vec::new();
+        let mut last: Option<std::sync::Arc<Yuv420>> = None;
+        for pkt in &seq {
+            if let Some(y) = dec.feed(pkt) {
+                last = Some(y);
+            }
+            if let Some(y) = &last {
+                shown.push(y.clone());
+            }
+        }
+        assert!(shown.len() >= 50, "playback produced too few frames");
+
+        // Compare what's on screen at the start vs the end of the baked span.
+        let a = &shown[shown.len().saturating_sub(38)];
+        let moved = shown[shown.len() - 30..]
+            .iter()
+            .any(|f| mean_abs_diff(&f.y, &a.y) > 2.0);
+        assert!(moved, "sequential playback is frozen across the baked overlay");
+    }
+
+    /// When a baked V1 overlay ends, the V2 source resumes mid-GOP and its
+    /// P-frames must decode against the *baked* final state (bleed/melt) — not
+    /// snap instantly back to the clean source. A snap would mean the render
+    /// resynced the decoder where no keyframe exists.
+    #[test]
+    fn overlay_end_bleeds_instead_of_snapping_clean() {
+        ffmpeg::init().unwrap();
+        let mut frames = Vec::new();
+        for i in 0..60usize {
+            let mut f = solid_yuv(128, 128, 30);
+            let x0 = (i * 2).min(110);
+            for y in 20..36 {
+                for x in x0..x0 + 16 {
+                    f.y[y * 128 + x] = 220;
+                }
+            }
+            frames.push(f);
+        }
+        let cancel = AtomicBool::new(false);
+        let source = encode_yuv_to_packet_clip(&frames, 30, &mut |_| {}, &cancel).unwrap();
+        // Strong, frame-filling effect so the bleed is unmistakable.
+        let effect = Effect::Bend(BendMode::Xor { mask: 0xFF });
+        let baked = bake_segment(&source, 20, 20, effect, 30, &mut |_| {}, &cancel).unwrap();
+
+        // V1 overlay (keyframe intact) at 20..40, V2 resumes mid-GOP at 40.
+        let mut seq: Vec<(OwnedPacket, usize)> = Vec::new();
+        for f in 0..60usize {
+            let (pkt, owner) = if (20..40).contains(&f) {
+                (&baked.packets[f - 20], 1usize)
+            } else {
+                (&source.packets[f], 0usize)
+            };
+            let i = seq.len() as i64;
+            seq.push((
+                OwnedPacket {
+                    data: pkt.data.clone(),
+                    pts: i,
+                    dts: i,
+                    duration: 1,
+                    is_key: pkt.is_key,
+                },
+                owner,
+            ));
+        }
+        let params = [source.codec_parameters.clone(), baked.codec_parameters.clone()];
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("wys.mp4");
+        crate::render::wysiwyg::bake_sequence_to_mp4(&seq, &params, 128, 128, 30, &out_path)
+            .unwrap();
+
+        let clip = crate::importer::read_clip_from_mp4(&out_path, "check", 0).unwrap();
+        let refs: Vec<&OwnedPacket> = clip.packets.iter().collect();
+        let mut dec = PacketDecoder::new(&clip.codec_parameters).unwrap();
+        let rendered = dec.decode_all(&refs).unwrap();
+
+        // Clean reference: decode the source alone.
+        let src_refs: Vec<&OwnedPacket> = source.packets.iter().collect();
+        let mut dec2 = PacketDecoder::new(&source.codec_parameters).unwrap();
+        let clean = dec2.decode_all(&src_refs).unwrap();
+
+        // Frame 40 (first after the overlay) must still carry the baked state:
+        // far from the clean source frame. By frame 59 it may have melted back.
+        let resume_diff = mean_abs_diff(&rendered[40].y, &clean[40].y);
+        assert!(
+            resume_diff > 20.0,
+            "V2 resume snapped clean (diff {resume_diff:.1}) — decoder was \
+             resynced at the overlay end where no keyframe exists"
+        );
     }
 
     #[test]

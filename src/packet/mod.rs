@@ -1,7 +1,12 @@
+use std::sync::Arc;
+
 /// Lightweight owned copy of an encoded video packet.
+/// `data` is shared — cloning a packet (or a whole clip) is a refcount bump,
+/// not a copy of the encoded bytes. The preview path clones packet runs every
+/// repaint, so this must stay cheap.
 #[derive(Debug, Clone)]
 pub struct OwnedPacket {
-    pub data: Vec<u8>,
+    pub data: Arc<[u8]>,
     pub pts: i64,
     pub dts: i64,
     pub duration: i64,

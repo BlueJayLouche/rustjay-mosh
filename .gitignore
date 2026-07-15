@@ -2,3 +2,6 @@
 .DS_Store
 artifacts/
 projects/
+# large local test media — never commit
+examples/testFiles/
+test_bundle.zip

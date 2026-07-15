@@ -45,7 +45,12 @@ pub fn import_video(path: &Path, name: impl Into<String>) -> Result<(PacketClip,
             "-bf", "0",
             "-pix_fmt", "yuv420p",
             "-movflags", "faststart",
-            "-preset", "fast",
+            // veryfast ≈ halves import time vs fast; CRF still governs quality.
+            // MUST stay in lockstep with bake::encode_yuv_to_packet_clip —
+            // mismatched SPS/PPS structure (preset, refs) makes moshed clips
+            // undecodable against each other and renders freeze on one frame.
+            "-preset", "veryfast",
+            "-refs", "1",
             "-crf", "18",
             temp_path.to_str().unwrap_or(""),
         ])
@@ -80,7 +85,7 @@ pub fn import_video(path: &Path, name: impl Into<String>) -> Result<(PacketClip,
         if s.index() != stream_idx {
             continue;
         }
-        let data = packet.data().unwrap_or(&[]).to_vec();
+        let data: std::sync::Arc<[u8]> = packet.data().unwrap_or(&[]).into();
         let is_key = packet.flags().contains(ffmpeg::codec::packet::Flags::KEY);
         packets.push(OwnedPacket {
             data,
@@ -143,7 +148,7 @@ pub fn read_clip_from_mp4(
         if s.index() != stream_idx {
             continue;
         }
-        let data = packet.data().unwrap_or(&[]).to_vec();
+        let data: std::sync::Arc<[u8]> = packet.data().unwrap_or(&[]).into();
         let is_key = packet.flags().contains(ffmpeg::codec::packet::Flags::KEY);
         packets.push(OwnedPacket {
             data,
