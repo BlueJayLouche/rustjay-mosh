@@ -200,35 +200,50 @@ pub fn save_bundle(dir: &Path, req: &SaveRequest) -> Result<(), ProjectError> {
     fs::create_dir_all(dir.join("media"))?;
     fs::create_dir_all(dir.join("audio"))?;
 
-    let mut packet_metas = Vec::with_capacity(req.packet_clips.len());
     for (i, clip) in req.packet_clips.iter().enumerate() {
-        let rel = format!("media/clip_{i}.mp4");
         export_packets(
             &clip.packets,
-            &dir.join(&rel),
+            &dir.join(format!("media/clip_{i}.mp4")),
             &clip.codec_parameters,
             clip.time_base,
         )?;
-        packet_metas.push(PacketClipMeta {
+    }
+    for (i, clip) in req.audio_clips.iter().enumerate() {
+        write_wav(&dir.join(format!("audio/audio_{i}.wav")), clip)?;
+    }
+
+    save_manifest(dir, req)
+}
+
+/// Write only `project.json`, assuming `dir`'s media files (written by an
+/// earlier [`save_bundle`] for the same media pool) are still valid. Timeline
+/// edits only change the manifest, so autosave uses this to avoid rewriting
+/// gigabytes of unchanged media.
+pub fn save_manifest(dir: &Path, req: &SaveRequest) -> Result<(), ProjectError> {
+    let packet_metas = req
+        .packet_clips
+        .iter()
+        .enumerate()
+        .map(|(i, clip)| PacketClipMeta {
             id: clip.id,
             name: clip.name.clone(),
             width: clip.width,
             height: clip.height,
-            media_file: rel,
-        });
-    }
+            media_file: format!("media/clip_{i}.mp4"),
+        })
+        .collect();
 
-    let mut audio_metas = Vec::with_capacity(req.audio_clips.len());
-    for (i, clip) in req.audio_clips.iter().enumerate() {
-        let rel = format!("audio/audio_{i}.wav");
-        write_wav(&dir.join(&rel), clip)?;
-        audio_metas.push(AudioClipMeta {
+    let audio_metas = req
+        .audio_clips
+        .iter()
+        .enumerate()
+        .map(|(i, clip)| AudioClipMeta {
             name: clip.name.clone(),
             sample_rate: clip.sample_rate,
             channels: clip.channels,
-            media_file: rel,
-        });
-    }
+            media_file: format!("audio/audio_{i}.wav"),
+        })
+        .collect();
 
     let manifest = ProjectManifest {
         format_version: FORMAT_VERSION,

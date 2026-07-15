@@ -197,6 +197,14 @@ impl TimelinePanel {
         v.max(a) as usize
     }
 
+    /// End of the video lane — the length a render/export should have.
+    /// Audio extending past the last video clip is cut at render time;
+    /// otherwise an untrimmed audio lane stretches the output to the full
+    /// source duration (an 8-minute file for a 1-minute edit).
+    pub fn video_frame_count(&self) -> usize {
+        self.clips.iter().map(|c| c.end_frame()).max().unwrap_or(0) as usize
+    }
+
     pub fn sorted_clips(&self) -> Vec<&TimelineClip> {
         let mut sorted: Vec<_> = self.clips.iter().collect();
         sorted.sort_by_key(|c| c.start_frame);

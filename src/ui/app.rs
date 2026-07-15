@@ -111,6 +111,12 @@ pub struct MoshApp {
 
     file_rx: mpsc::Receiver<PathBuf>,
     file_tx: mpsc::SyncSender<PathBuf>,
+    /// Files waiting to import; drained one at a time by pump_import_queue.
+    import_queue: Vec<PathBuf>,
+    import_in_flight: bool,
+    /// Failures collected during a batch, reported once when the queue drains
+    /// (per-file errors would be overwritten by the next import's status).
+    import_failures: Vec<String>,
 
     import_rx: mpsc::Receiver<Result<ImportResult, String>>,
     import_tx: mpsc::SyncSender<Result<ImportResult, String>>,
@@ -186,6 +192,12 @@ pub struct MoshApp {
     proj_msg_tx: mpsc::Sender<ProjectMsg>,
     proj_busy: bool,
     last_autosave: Instant,
+    /// Fingerprint of the media pool covered by the autosave dir's media files.
+    /// While it matches, autosave only rewrites the (tiny) manifest.
+    autosave_media_fp: Option<u64>,
+    autosave_in_flight: bool,
+    autosave_rx: mpsc::Receiver<Result<u64, String>>,
+    autosave_tx: mpsc::Sender<Result<u64, String>>,
     /// Set when "New Project" needs to confirm discarding unsaved changes.
     show_new_confirm: bool,
     /// Set when a save was requested via the confirm's "Save first…" — start a
@@ -215,6 +227,7 @@ impl MoshApp {
         let (preview_res_tx, preview_res_rx) = mpsc::channel();
         let (proj_req_tx, proj_req_rx) = mpsc::sync_channel(1);
         let (proj_msg_tx, proj_msg_rx) = mpsc::channel();
+        let (autosave_tx, autosave_rx) = mpsc::channel();
 
         // Offer crash recovery if a previous session left an autosave bundle.
         let recovery_available = project::autosave_path()
@@ -233,6 +246,9 @@ impl MoshApp {
             clip_uid: 0,
             file_rx,
             file_tx,
+            import_queue: Vec::new(),
+            import_in_flight: false,
+            import_failures: Vec::new(),
             import_rx,
             import_tx,
             render_rx,
@@ -295,6 +311,10 @@ impl MoshApp {
             proj_msg_tx,
             proj_busy: false,
             last_autosave: Instant::now(),
+            autosave_media_fp: None,
+            autosave_in_flight: false,
+            autosave_rx,
+            autosave_tx,
             show_new_confirm: false,
             new_after_save: false,
 
@@ -425,6 +445,7 @@ impl MoshApp {
                 if let Some(rec) = project::autosave_path() {
                     let _ = std::fs::remove_dir_all(&rec);
                 }
+                self.autosave_media_fp = None;
                 self.recovery_available = None;
                 self.status = format!("Saved project → {}", dir.display());
                 // If this save was requested to clear the way for a new project,
@@ -669,7 +690,7 @@ impl MoshApp {
             let c = &self.packet_clips[leading_clip_idx];
             (c.width, c.height)
         };
-        let total_frames = self.timeline.total_frame_count();
+        let total_frames = self.timeline.video_frame_count();
         let audio_sources = self.audio_clips.clone();
         let audio_timeline: Vec<AudioTimelineClip> = self.timeline.audio_clips.clone();
         let tx = self.proj_msg_tx.clone();
@@ -775,6 +796,16 @@ impl MoshApp {
 
     /// Drain the project dialog + result channels.
     fn poll_project_io(&mut self, ctx: &egui::Context) {
+        while let Ok(res) = self.autosave_rx.try_recv() {
+            self.autosave_in_flight = false;
+            match res {
+                Ok(fp) => {
+                    self.autosave_media_fp = Some(fp);
+                    self.status = "Autosaved recovery snapshot.".into();
+                }
+                Err(e) => self.status = format!("Autosave failed: {e}"),
+            }
+        }
         if let Ok(req) = self.proj_req_rx.try_recv() {
             self.handle_project_request(req, ctx);
         }
@@ -802,22 +833,84 @@ impl MoshApp {
     }
 
     /// Periodically write a recovery bundle so a crash doesn't lose work.
-    fn maybe_autosave(&mut self) {
+    /// Cheap identity of the media pool. A bundle's media files depend only on
+    /// the pool, so while this matches the last full autosave we only rewrite
+    /// the manifest.
+    /// ponytail: length-based, not a content hash — a same-size pool swap goes
+    /// undetected; hash packet bytes if that ever bites.
+    fn pool_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for c in &self.packet_clips {
+            c.packets.len().hash(&mut h);
+            c.packets.iter().map(|p| p.data.len() as u64).sum::<u64>().hash(&mut h);
+        }
+        for a in &self.audio_clips {
+            a.samples.len().hash(&mut h);
+        }
+        h.finish()
+    }
+
+    fn maybe_autosave(&mut self, ctx: &egui::Context) {
         const INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
-        if !self.project_dirty || self.proj_busy || self.bake_in_progress || self.is_rendering {
+        if !self.project_dirty
+            || self.proj_busy
+            || self.bake_in_progress
+            || self.is_rendering
+            || self.autosave_in_flight
+        {
             return;
         }
         if self.last_autosave.elapsed() < INTERVAL {
             return;
         }
         self.last_autosave = Instant::now();
-        if let Some(dir) = project::autosave_path() {
+        let Some(dir) = project::autosave_path() else { return };
+
+        // Timeline edits only touch the manifest; media files change only when
+        // the pool does. Skip rewriting gigabytes of unchanged media.
+        let fp = self.pool_fingerprint();
+        if self.autosave_media_fp == Some(fp) && dir.join("project.json").exists() {
             let req = self.save_request();
-            match project::save_bundle(&dir, &req) {
+            match project::save_manifest(&dir, &req) {
                 Ok(()) => self.status = "Autosaved recovery snapshot.".into(),
                 Err(e) => self.status = format!("Autosave failed: {e}"),
             }
+            return;
         }
+
+        // Full save writes all media (GBs for long clips) — keep it off the UI
+        // thread. Packet data is Arc-shared, so these clones are cheap.
+        self.autosave_in_flight = true;
+        self.status = "Autosaving recovery snapshot…".into();
+        let packet_clips = self.packet_clips.clone();
+        let audio_clips = self.audio_clips.clone();
+        let video_timeline = self.timeline.clips.clone();
+        let audio_timeline = self.timeline.audio_clips.clone();
+        let render_fps = self.render_fps;
+        let export_preset = self.export_preset;
+        let zoom = self.timeline.zoom;
+        let playhead = self.timeline.playhead;
+        let tx = self.autosave_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let req = SaveRequest {
+                packet_clips: &packet_clips,
+                audio_clips: &audio_clips,
+                video_timeline: &video_timeline,
+                audio_timeline: &audio_timeline,
+                render_fps,
+                export_preset,
+                zoom,
+                playhead,
+            };
+            let _ = tx.send(
+                project::save_bundle(&dir, &req)
+                    .map(|_| fp)
+                    .map_err(|e| e.to_string()),
+            );
+            ctx.request_repaint();
+        });
     }
 
     /// Detect a completed edit (timeline state changed while not mid-drag) and
@@ -872,21 +965,51 @@ impl MoshApp {
         let tx = self.file_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            if let Some(p) = rfd::FileDialog::new()
+            if let Some(paths) = rfd::FileDialog::new()
                 .add_filter("Video", &["mp4", "mov", "mkv", "avi", "webm", "m4v"])
                 .add_filter("Audio", &["wav", "mp3", "aac", "flac", "m4a", "ogg"])
-                .pick_file()
+                .pick_files()
             {
-                let _ = tx.send(p);
-                ctx.request_repaint();
+                for p in paths {
+                    let _ = tx.send(p);
+                    ctx.request_repaint();
+                }
             }
         });
     }
 
     // ── Import ────────────────────────────────────────────────────────────────
 
+    /// Start the next queued import if none is running. Imports run one at a
+    /// time — each transcode already uses every core, so parallel imports
+    /// would only thrash CPU and RAM on multi-GB clips.
+    fn pump_import_queue(&mut self, ctx: &egui::Context) {
+        if self.import_in_flight {
+            return;
+        }
+        if self.import_queue.is_empty() {
+            if !self.import_failures.is_empty() {
+                self.status = format!(
+                    "Import finished — {} file(s) failed: {}",
+                    self.import_failures.len(),
+                    self.import_failures.join(" | ")
+                );
+                self.import_failures.clear();
+            }
+            return;
+        }
+        let path = self.import_queue.remove(0);
+        self.start_import(path, ctx);
+    }
+
     fn start_import(&mut self, path: PathBuf, ctx: &egui::Context) {
-        self.status = format!("Importing {}…", path.display());
+        self.import_in_flight = true;
+        let queued = self.import_queue.len();
+        self.status = if queued > 0 {
+            format!("Importing {} ({queued} more queued)…", path.display())
+        } else {
+            format!("Importing {}…", path.display())
+        };
         let tx = self.import_tx.clone();
         let ctx = ctx.clone();
         let fps = self.render_fps;
@@ -1237,9 +1360,8 @@ impl MoshApp {
                 });
             });
         self.show_bend_dialog = open;
-        if !self.show_bend_dialog {
-            self.bend_preview_tex = None;
-        }
+        // The preview texture is intentionally kept alive across dialog
+        // open/close — see draw_effect_preview.
     }
 
     /// Build the `BendMode` from dialog state. `noise_seed` is injected so the
@@ -1302,8 +1424,22 @@ impl MoshApp {
                 [frame.width as usize, frame.height as usize],
                 &yuv_to_rgba(&frame),
             );
-            let tex = ui.ctx().load_texture(tex_name, image, egui::TextureOptions::LINEAR);
-            *cache = Some((params, src, tex));
+            // egui-wgpu 0.29 destroys freed textures *before* the frame's
+            // Queue::submit, so dropping a handle in the same frame that
+            // painted it panics wgpu. Never free these: keep one persistent
+            // texture per dialog and update it in place.
+            match cache {
+                Some((p, s, tex)) => {
+                    tex.set(image, egui::TextureOptions::LINEAR);
+                    *p = params;
+                    *s = src;
+                }
+                None => {
+                    let tex =
+                        ui.ctx().load_texture(tex_name, image, egui::TextureOptions::LINEAR);
+                    *cache = Some((params, src, tex));
+                }
+            }
         }
         if let Some((_, _, tex)) = cache {
             ui.add(egui::Image::new(&*tex).max_size(egui::vec2(420.0, 240.0)));
@@ -1403,9 +1539,8 @@ impl MoshApp {
                 });
             });
         self.show_compress_dialog = open;
-        if !self.show_compress_dialog {
-            self.compress_preview_tex = None;
-        }
+        // The preview texture is intentionally kept alive across dialog
+        // open/close — see draw_effect_preview.
     }
 
     /// Map the dialog "Duration" radio index to a `(start, count)` pair in
@@ -1666,15 +1801,21 @@ impl MoshApp {
             .collect();
         let leading_clip_idx = seq_refs[0].1;
 
+        // Keyframe count tells the user at a glance whether a clip they meant
+        // to mosh still carries its keyframe (a keyframe = a clean cut).
+        let key_count = render_packets.iter().filter(|(p, _)| p.is_key).count();
         let preset = self.export_preset;
         if preset.re_encodes() {
             self.status = format!(
-                "Encoding delivery master ({}) — {} packets…",
+                "Encoding delivery master ({}) — {} packets, {key_count} keyframe(s) in sequence…",
                 preset.label(),
                 render_packets.len()
             );
         } else {
-            self.status = format!("Rendering {} video packets…", render_packets.len());
+            self.status = format!(
+                "Rendering {} video packets, {key_count} keyframe(s) in sequence…",
+                render_packets.len()
+            );
         }
         self.is_rendering = true;
 
@@ -1690,7 +1831,7 @@ impl MoshApp {
             let c = &self.packet_clips[leading_clip_idx];
             (c.width, c.height)
         };
-        let total_frames = self.timeline.total_frame_count();
+        let total_frames = self.timeline.video_frame_count();
         let audio_sources = self.audio_clips.clone();
         let audio_timeline: Vec<AudioTimelineClip> = self.timeline.audio_clips.clone();
 
@@ -1965,18 +2106,26 @@ fn build_playback_sequence<'a>(
 impl eframe::App for MoshApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ── Drain channels ────────────────────────────────────────────────────
-        if let Ok(path) = self.file_rx.try_recv() {
-            self.start_import(path, ctx);
+        while let Ok(path) = self.file_rx.try_recv() {
+            self.import_queue.push(path);
         }
 
         match self.import_rx.try_recv() {
-            Ok(Ok(r)) => self.finish_import(r, ctx),
-            Ok(Err(e)) => self.status = e,
+            Ok(Ok(r)) => {
+                self.import_in_flight = false;
+                self.finish_import(r, ctx);
+            }
+            Ok(Err(e)) => {
+                self.import_in_flight = false;
+                self.status = e.clone();
+                self.import_failures.push(e);
+            }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.status = "Import thread crashed — check terminal for details.".into();
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
+        self.pump_import_queue(ctx);
 
         if let Ok(path) = self.render_rx.try_recv() {
             self.start_render(path, ctx);
@@ -2511,6 +2660,6 @@ impl eframe::App for MoshApp {
         // End-of-frame bookkeeping: capture an undo point if the timeline
         // changed this frame, then run the autosave heartbeat.
         self.commit_edit_if_changed();
-        self.maybe_autosave();
+        self.maybe_autosave(ctx);
     }
 }
