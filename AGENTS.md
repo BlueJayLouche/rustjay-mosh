@@ -69,7 +69,10 @@ Needs: Rust 1.85+, FFmpeg 8.x, GPU with Metal/Vulkan/DX12 support.
 ## Data flow
 
 ### Import (video)
-1. User picks a file → `MoshApp::start_import` spawns thread
+1. User picks one or more files (multi-select dialog) → paths land in
+   `MoshApp::import_queue`; `pump_import_queue` runs them **one at a time**
+   (each transcode already saturates all cores) and reports any per-file
+   failures once when the batch drains → `start_import` spawns thread
 2. `importer::import_video` runs ffmpeg CLI: `ffmpeg -i input -vf scale=1920:1080 -vcodec libx264 -g 99999999 -bf 0 -pix_fmt yuv420p temp.mp4` (project resolution is 1920×1080; `PROJECT_WIDTH`/`PROJECT_HEIGHT` in `importer/mod.rs`)
 3. Reads packets from temp MP4 into `Vec<OwnedPacket>`
 4. Decodes first packet to get a `Yuv420` preview frame
@@ -104,7 +107,10 @@ Needs: Rust 1.85+, FFmpeg 8.x, GPU with Metal/Vulkan/DX12 support.
    H.264 (CRF 12, 2 s GOP). **Never direct-remux the moshed packets to the
    final output** — the illegal reference structure makes ffmpeg drop frames
    at every moshed cut and QuickTime/VideoToolbox freeze on it entirely.
-4. If audio clips exist: `audio::render_audio_mix()` → temp `audio.wav` (48kHz stereo f32)
+4. If audio clips exist: `audio::render_audio_mix()` → temp `audio.wav` (48kHz stereo f32),
+   sized to `TimelinePanel::video_frame_count()` (the video lane's end) — **not** the
+   audio lane, so an untrimmed audio clip can't stretch a 1-minute edit into a
+   full-source-length export
 5. **Delivery pass** — `ExportPreset::build_ffmpeg_args()` (in `render/delivery.rs`)
    produces the final ffmpeg CLI args from the user-selected export preset
    (`MoshApp::export_preset`), muxing in `audio.wav` if present, then writing
@@ -145,6 +151,31 @@ Release builds bundle the `ffmpeg` CLI binary inside the package (macOS: `Conten
 ### Audio clip drag modes
 Normal drag on audio clip edge = **trim** (same as video). Hold **Shift** + drag on left/right half = **fade in/out**.
 
+### Importer and bake encoder must stay in x264 lockstep
+Mosh drops keyframes, so one clip's P-frames get parsed under *another* clip's
+SPS/PPS. If the importer CLI and `bake::encode_yuv_to_packet_clip` use
+different x264 configs (preset, refs), the headers misparse, the decoder
+refuses every frame ("deblocking_filter_idc out of range … no frame!") and the
+WYSIWYG render holds one frame for the whole moshed span. Both are pinned to
+`preset veryfast, refs 1, bf 0, sc_threshold 0` — change them **together**
+(regression test: `tests/mosh_compat.rs`). Media imported/baked by older
+builds has old headers; re-import/re-bake for clean moshing.
+
+### Never free egui textures the same frame they're painted
+egui-wgpu 0.29's `free_texture` calls `wgpu::Texture::destroy()` **before** the
+frame's `Queue::submit`, so dropping a `TextureHandle` in a frame that also
+painted it panics with "Texture … has been destroyed". Dialog live previews
+therefore keep one persistent `TextureHandle` each and update it via
+`TextureHandle::set` (`draw_effect_preview`); they are never set back to `None`.
+Don't add per-frame `ctx.load_texture` churn.
+
+### Packet data is shared, not owned
+`OwnedPacket.data` is `Arc<[u8]>`. The preview path clones the packet run from
+the last keyframe to the playhead on **every repaint**, and long-GOP clips have
+one keyframe for the whole file — with `Vec<u8>` data that was up to GBs of
+memcpy per frame. Keep packet clones refcount-cheap; never switch this back to
+an owning buffer.
+
 ### Packet iterator bug (fixed)
 `ClipSpan::iter_packets()` was skipping the leading keyframe but not adjusting visible count, causing a 1-frame gap in renders. Fixed by shrinking `visible_count` when `drop_leading_keyframe` is true.
 
@@ -172,7 +203,9 @@ my_project.rjmosh/
 - **Autosave**: `MoshApp::maybe_autosave` writes a recovery bundle to
   `<config>/rustjay-mosh/autosave/recovery.rjmosh` every 120 s while dirty and
   idle; on startup a found snapshot is offered via a recovery banner. A clean
-  save deletes it.
+  save deletes it. Full media writes run on a background thread; while the
+  media pool is unchanged (`pool_fingerprint`), only the manifest is rewritten
+  (`project::save_manifest`) — media files can be GBs for long clips.
 - **Undo/redo** is snapshot-based: `commit_edit_if_changed()` (end of every
   frame, skipped mid-drag) pushes the previous `EditSnapshot { clips, audio_clips }`
   when the timeline changed. Heavy media is never snapshotted. Ctrl+Z / Ctrl+Shift+Z.
